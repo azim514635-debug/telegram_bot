@@ -142,9 +142,16 @@ def is_admin(user_id: int) -> bool:
     return user_id in admins
 
 
+def is_owner(user_id: int) -> bool:
+    owner = config.get("owner_id")
+    if not owner:
+        return True  # no owner set, allow all
+    return user_id == owner
+
+
 def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not is_admin(update.effective_user.id):
+        if not is_admin(update.effective_user.id) or not is_owner(update.effective_user.id):
             await update.message.reply_text(
                 "Access denied.\n"
                 f"Your ID: <code>{update.effective_user.id}</code>",
@@ -158,7 +165,7 @@ def admin_only(func):
 def admin_only_cb(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
-        if not is_admin(query.from_user.id):
+        if not is_admin(query.from_user.id) or not is_owner(query.from_user.id):
             await query.answer("Access denied.", show_alert=True)
             return
         return await func(update, context)
@@ -274,7 +281,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Welcome, <b>{escape_html(name)}</b>!\n\n"
         "I'm the <b>Azim's Space</b> upload bot.\n"
         "Use the buttons below or send /commands.\n\n"
-        "<i>Tip: Use /upload to quickly add a link.</i>"
+        "<i>Tip: Use /upload to quickly add a link.</i>\n\n"
+        "First time? Send /myid to get your ID, then /setowner to lock the bot."
     )
     await update.message.reply_text(
         text, parse_mode="HTML", reply_markup=main_menu_keyboard()
@@ -287,6 +295,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_typing(update)
     text = (
         "<b>Commands</b>\n\n"
+        "/myid — Get your Telegram user ID\n"
+        "/setowner — Lock bot to only your ID\n"
         "/upload — Upload a new link\n"
         "/links — View recent links\n"
         "/delete — Delete a link by ID\n"
@@ -297,6 +307,48 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — Show this message\n"
     )
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=back_button())
+
+
+# ── /myid ──────────────────────────────────────────────────────────
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = update.effective_user.first_name or ""
+    username = update.effective_user.username or ""
+    text = (
+        f"<b>Your Telegram Info</b>\n\n"
+        f"User ID: <code>{user_id}</code>\n"
+        f"Name: {escape_html(name)}\n"
+        f"Username: @{escape_html(username) if username else 'none'}\n\n"
+        f"Copy the ID above and send /setowner to lock this bot to only you."
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+# ── /setowner ──────────────────────────────────────────────────────
+@admin_only
+async def cmd_setowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if args:
+        try:
+            owner_id = int(args[0])
+        except ValueError:
+            await update.message.reply_text("Invalid ID. Must be a number.")
+            return
+        config.set("owner_id", owner_id)
+        await update.message.reply_text(
+            f"Bot locked to user ID: <code>{owner_id}</code>\n"
+            f"Only this user can now use the bot.",
+            parse_mode="HTML",
+            reply_markup=back_button(),
+        )
+        return
+    await update.message.reply_text(
+        "<b>Lock Bot to Your ID</b>\n\n"
+        "1. Send /myid to get your user ID\n"
+        "2. Then send /setowner <code>YOUR_ID</code>\n\n"
+        "Example: /setowner 123456789",
+        parse_mode="HTML",
+    )
 
 
 # ── Menu callback router ───────────────────────────────────────────
@@ -395,6 +447,14 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text(
+            "Access denied.\n"
+            f"Your ID: <code>{update.effective_user.id}</code>",
+            parse_mode="HTML",
+        )
+        return
+
     state = context.user_data.get("state")
     text = update.message.text.strip()
 
@@ -655,6 +715,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Open main menu"),
+        BotCommand("myid", "Get your Telegram user ID"),
+        BotCommand("setowner", "Lock bot to only your ID"),
         BotCommand("upload", "Upload a new link"),
         BotCommand("links", "View recent links"),
         BotCommand("delete", "Delete a link by ID"),
@@ -716,6 +778,8 @@ def register_handlers(app):
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("setowner", cmd_setowner))
     app.add_handler(CommandHandler("links", cmd_start))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
