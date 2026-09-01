@@ -1,4 +1,32 @@
 services:
+  # ── Main web app (Node.js) ──
+  - type: web
+    name: azim-studio
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: CLOUDINARY_URL
+        sync: false
+      - key: DB_URL
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_PATH
+        value: ./azim-studio-chat-firebase-adminsdk-fbsvc-5b2075d166.json
+      - key: FCM_VAPID_KEY
+        sync: false
+      - key: FIREBASE_API_KEY
+        sync: false
+      - key: FIREBASE_APP_ID
+        sync: false
+      - key: FIREBASE_MESSAGING_SENDER_ID
+        sync: false
+
+  # ── Telegram bot (Python, Web Service for webhook) ──
   - type: web
     name: azim-telegram-bot
     runtime: python
@@ -11,4 +39,4 @@ services:
       - key: PYTHON_VERSION
         value: "3.12.0"
       - key: WEBHOOK_SECRET
-        generateValue: true
+        value: "azim-webhook-secret-2024"

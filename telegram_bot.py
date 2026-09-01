@@ -808,6 +808,8 @@ def main():
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
     port = int(os.environ.get("PORT", 8443))
     secret_token = os.environ.get("WEBHOOK_SECRET", "azim-webhook-secret")
+    # Telegram only allows A-Z, a-z, 0-9, hyphens, underscores
+    secret_token = re.sub(r"[^A-Za-z0-9_-]", "-", secret_token)
 
     app = build_app(token)
     register_handlers(app)
