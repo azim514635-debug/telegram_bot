@@ -243,6 +243,38 @@ def upload_link_api(title, url, thumbnail_url=""):
     return False, body.get("error", f"HTTP {status}")
 
 
+VIDEO_HINTS = ("video/", ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts",
+               ".3gp", ".ogv", ".wmv", ".flv", ".mpeg", ".mpg")
+
+
+def is_video_url(url):
+    """Detect whether a URL points to a playable video (HEAD check + filename hint)."""
+    low = (url or "").lower()
+    if not low.startswith(("http://", "https://")):
+        return False
+    if any(low.rstrip("/").endswith(h) for h in VIDEO_HINTS if h.startswith(".")):
+        return True
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            return ctype.startswith("video/")
+    except Exception:
+        return False
+
+
+def register_movie_api(title, url, thumbnail_url=""):
+    entry = {"title": title, "mediaUrl": url, "thumbnailUrl": thumbnail_url, "type": "movie"}
+    for _ in range(3):
+        status, body = api_request("/api/upload/finalize", "POST", entry, config.boss_secret)
+        if status in (301, 302, 307, 308):
+            continue
+        break
+    if status == 200 and isinstance(body, dict) and body.get("success"):
+        return True, body.get("item", {})
+    return False, body.get("error", f"HTTP {status}")
+
+
 def fetch_links():
     status, body = api_request("/api/links")
     if status == 200 and isinstance(body, list):
@@ -934,20 +966,37 @@ async def upload_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.edit_message_text("Uploading...")
-    success, result = upload_link_api(
-        data["title"], data["url"], data.get("thumbnail", "")
-    )
+    is_video = is_video_url(data["url"])
+    if is_video:
+        success, result = register_movie_api(
+            data["title"], data["url"], data.get("thumbnail", "")
+        )
+    else:
+        success, result = upload_link_api(
+            data["title"], data["url"], data.get("thumbnail", "")
+        )
 
     if success:
         stats.inc("uploads")
         item_id = result.get("id", "?") if isinstance(result, dict) else result
-        web_url = f"{PUBLIC_BASE_URL}/dl/file/{item_id}"
-        text = (
-            "<b>Upload Successful</b>\n\n"
-            f"Title: <b>{escape_html(data['title'])}</b>\n"
-            f"ID: <code>{escape_html(str(item_id))}</code>\n\n"
-            f'Open: <a href="{web_url}">{web_url}</a>'
-        )
+        if is_video:
+            bucket = "video"
+            text = (
+                "<b>Video Registered</b>\n\n"
+                f"Title: <b>{escape_html(data['title'])}</b>\n"
+                f"ID: <code>{escape_html(str(item_id))}</code>\n\n"
+                f'Watch: <a href="{PUBLIC_BASE_URL}/stream/{bucket}/{item_id}">'
+                f"{PUBLIC_BASE_URL}/stream/{bucket}/{item_id}</a>\n\n"
+                "<i>Note: if this URL expires, the stream breaks. Use a permanent host for lasting playback.</i>"
+            )
+        else:
+            web_url = f"{PUBLIC_BASE_URL}/dl/file/{item_id}"
+            text = (
+                "<b>Upload Successful</b>\n\n"
+                f"Title: <b>{escape_html(data['title'])}</b>\n"
+                f"ID: <code>{escape_html(str(item_id))}</code>\n\n"
+                f'Open: <a href="{web_url}">{web_url}</a>'
+            )
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=back_button())
     else:
         await query.edit_message_text(
