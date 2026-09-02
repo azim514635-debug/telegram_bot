@@ -1249,7 +1249,7 @@ def register_handlers(app):
     # File-to-Link: capture any forwarded/sent media (documents, video,
     # audio, voice, photos, animations) and publish it to the Updates feed.
     MEDIA_FILTER = (
-        filters.DOCUMENT
+        filters.Document.ALL
         | filters.VIDEO
         | filters.AUDIO
         | filters.VOICE
