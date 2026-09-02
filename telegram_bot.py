@@ -54,8 +54,11 @@ from telegram.ext import (
 
 # ── Load .env into the environment before reading any config ───────
 def load_env_file():
-    env_file = Path(__file__).parent / ".env"
-    if not env_file.exists():
+    for name in (".env.bot", ".env"):
+        env_file = Path(__file__).parent / name
+        if env_file.exists():
+            break
+    else:
         return
     with open(env_file, encoding="utf-8") as f:
         for line in f:
@@ -530,7 +533,9 @@ def back_button():
 
 
 async def send_typing(update: Update):
-    await update.get_chat().send_action("typing")
+    chat = update.effective_chat
+    if chat is not None:
+        await chat.send_action("typing")
 
 
 def mask_secret(s):
