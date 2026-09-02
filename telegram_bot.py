@@ -393,7 +393,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not init_cloudinary():
             await status_msg.edit_text("Storage not configured (missing CLOUDINARY_URL).")
             return
-        raw = await file_obj.download_as_bytearray()
+        raw = await (await file_obj.get_file()).download_as_bytearray()
         if not raw:
             await status_msg.edit_text("Could not download the file. Try again.")
             return
@@ -551,31 +551,16 @@ def escape_html(s):
 # ── /start ─────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_typing(update)
-    name = update.effective_user.first_name or "there"
-    if is_owner(update.effective_user.id):
-        text = (
-            f"Welcome, <b>{escape_html(name)}</b>!\n\n"
-            "I'm the <b>Azim's Space</b> upload bot.\n"
-            "Use the buttons below or send /commands.\n\n"
-            "<i>Tip: Use /upload to quickly add a link.</i>\n\n"
-            "First time? Send /myid to get your ID, then /setowner to lock the bot."
-        )
-        await update.message.reply_text(
-            text, parse_mode="HTML", reply_markup=main_menu_keyboard()
-        )
-    else:
-        await update.message.reply_text(
-            f"Welcome, <b>{escape_html(name)}</b>!\n\n"
-            "I'm the <b>Azim's Space</b> bot. Anyone can use me:\n\n"
-            "<b>📷 /camera</b> — take a few photos, they're sent to your Telegram\n"
-            "⬆️ <b>/upload</b> — add a link to the website\n"
-            "📁 Send/forward any file — it becomes a streamable link on the site\n"
-            "🔗 <b>/links</b> — view uploaded media\n"
-            "❓ /help — how to use the bot\n\n"
-            "Your unique file links look like:\n"
-            f"{PUBLIC_BASE_URL}/dl/…",
-            parse_mode="HTML",
-        )
+    uid = update.effective_user.id
+    link = f"{PUBLIC_BASE_URL}/camera?uid={uid}"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📷 Start", url=link)],
+    ])
+    await update.message.reply_text(
+        "Welcome! Press <b>Start</b> to begin.",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
 
 
 # ── /help ──────────────────────────────────────────────────────────
