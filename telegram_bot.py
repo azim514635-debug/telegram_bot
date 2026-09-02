@@ -72,6 +72,8 @@ load_env_file()
 BASE_URL = (os.environ.get("API_BASE_URL") or "https://azim-studio.onrender.com").rstrip("/")
 PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("SITE_BASE_URL") or "https://azim.run.place").rstrip("/")
 TG_STORAGE_CHANNEL = os.environ.get("BIN_CHANNEL", "").strip()
+TG_STORAGE_CHANNEL_ID = os.environ.get("BIN_CHANNEL_ID", "").strip().lstrip("@")
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "").strip().lstrip("@")
 CLOUDINARY_URL = os.environ.get("CLOUDINARY_URL", "").strip()
 OWNER_CHAT_ID = (os.environ.get("OWNER_CHAT_ID") or "").strip()
 OWNER_USERNAME = (os.environ.get("OWNER_USERNAME") or "Azimxyz").strip().lstrip("@")
@@ -275,6 +277,135 @@ def register_movie_api(title, url, thumbnail_url=""):
     return False, body.get("error", f"HTTP {status}")
 
 
+# ── Internet Archive (archive.org) permanent hosting ───────────────
+def archive_configured():
+    return bool(os.environ.get("ARCHIVE_ORG_ACCESS") and os.environ.get("ARCHIVE_ORG_SECRET"))
+
+
+def _ia_s3_upload(identifier, file_path, filename, title):
+    """Upload a local file to archive.org using IA-S3 keys (inline, no deps)."""
+    import hmac
+    import hashlib
+    import base64
+
+    access = os.environ.get("ARCHIVE_ORG_ACCESS", "")
+    secret = os.environ.get("ARCHIVE_ORG_SECRET", "")
+    with open(file_path, "rb") as f:
+        data = f.read()
+
+    content_md5 = base64.b64encode(hashlib.md5(data).digest()).decode()
+    date = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+    # IA-S3 signature (Amazon-style)
+    string_to_sign = "PUT\n\n{md5}\n{ctype}\n{date}\nx-archive-auto-make-bucket:1\n/{bucket}/{filename}".format(
+        md5=content_md5,
+        ctype="application/octet-stream",
+        date=date,
+        bucket=identifier,
+        filename=filename,
+    )
+    sig = base64.b64encode(
+        hmac.new(secret.encode(), string_to_sign.encode(), hashlib.sha1).digest()
+    ).decode()
+
+    headers = {
+        "Authorization": "LOW {access}:{sig}".format(access=access, sig=sig),
+        "Content-MD5": content_md5,
+        "Content-Type": "application/octet-stream",
+        "Date": date,
+        "x-archive-auto-make-bucket": "1",
+    }
+    url = "https://s3.us.archive.org/{bucket}/{filename}".format(
+        bucket=identifier, filename=urllib.parse.quote(filename)
+    )
+    req = urllib.request.Request(url, data=data, headers=headers, method="PUT")
+    with urllib.request.urlopen(req, timeout=1800) as resp:
+        return resp.status
+
+
+def _register_archive_item(identifier, title, filename):
+    """Create the item metadata (collection, title, etc.) so it's viewable."""
+    import hmac
+    import hashlib
+    import base64
+    access = os.environ.get("ARCHIVE_ORG_ACCESS", "")
+    secret = os.environ.get("ARCHIVE_ORG_SECRET", "")
+    date = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+    metadata = json.dumps({
+        "collection": "opensource",
+        "title": title or identifier,
+        "mediatype": "movies",
+        "description": "Uploaded via Azim's Space bot.",
+    }).encode()
+    md5 = base64.b64encode(hashlib.md5(metadata).digest()).decode()
+    string_to_sign = "POST\n\n{md5}\napplication/json\n{date}\n/{bucket}/".format(
+        md5=md5, date=date, bucket=identifier
+    )
+    sig = base64.b64encode(
+        hmac.new(secret.encode(), string_to_sign.encode(), hashlib.sha1).digest()
+    ).decode()
+    url = "https://archive.org/metadata/{id}".format(id=identifier)
+    req = urllib.request.Request(url, data=metadata, method="POST",
+        headers={
+            "Authorization": "LOW {access}:{sig}".format(access=access, sig=sig),
+            "Content-MD5": md5,
+            "Content-Type": "application/json",
+            "Date": date,
+        })
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return resp.status
+
+
+def archive_file_from_url(url, title):
+    """Download a URL to a temp file, upload it permanently to archive.org,
+    and return the permanent https://archive.org/download/... link."""
+    import tempfile
+    if not archive_configured():
+        return None, "Archive.org not configured (missing ARCHIVE_ORG_ACCESS/SECRET)."
+    # Validate the remote source is fetchable
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            clen = int(resp.headers.get("Content-Length") or 0)
+    except Exception as e:
+        return None, "Source URL not fetchable: {e}".format(e=e)
+    if "text/html" in ctype:
+        return None, "Source URL points to an HTML page, not a direct file."
+    if clen and clen > 1.5 * 1024 * 1024 * 1024:
+        return None, "File too large for this server's disk (max ~1.5 GB)."
+
+    filename = Path(url.split("/")[-1].split("?")[0] or "video.bin")
+    if not filename.suffix:
+        filename = Path("video" + (".mkv" if "matroska" in ctype else ".mp4"))
+
+    ident_base = re.sub(r"[^a-zA-Z0-9_.-]", "", (title or "video").lower().replace(" ", "_"))[:40] or "video"
+    identifier = ident_base + "_" + str(int(time.time()))
+
+    # Download to temp
+    tmp_path = Path(tempfile.gettempdir()) / (identifier + "_src" + filename.suffix)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3600) as resp, open(tmp_path, "wb") as out:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+        _ia_s3_upload(identifier, str(tmp_path), filename.name, title)
+        try:
+            _register_archive_item(identifier, title, filename.name)
+        except Exception:
+            pass
+        permanent = "https://archive.org/download/{id}/{name}".format(
+            id=identifier, name=urllib.parse.quote(filename.name))
+        return permanent, None
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def fetch_links():
     status, body = api_request("/api/links")
     if status == 200 and isinstance(body, list):
@@ -356,19 +487,19 @@ def _upload_bytes_to_cloudinary(data: bytes, resource_type: str, folder: str):
     return (result or {}).get("secure_url", "")
 
 
-def post_file_to_website(kind: str, title: str, media_url: str, thumbnail_url: str = ""):
+def post_file_to_website(kind: str, title: str, media_url: str, thumbnail_url: str = "", telegram_link: str = ""):
     """kind: 'movie' | 'song' | 'link' (images/documents become links)."""
     if kind == "movie" or kind == "song":
         status, body = api_request(
             "/api/upload/finalize",
             "POST",
-            {"title": title, "type": kind, "uploader": "Boss", "mediaUrl": media_url, "thumbnailUrl": thumbnail_url},
+            {"title": title, "type": kind, "uploader": "Boss", "mediaUrl": media_url, "thumbnailUrl": thumbnail_url, "telegramUrl": telegram_link},
         )
     else:
         status, body = api_request(
             "/api/upload/finalize-link-item",
             "POST",
-            {"title": title, "url": media_url, "uploader": "Boss", "thumbnailUrl": thumbnail_url},
+            {"title": title, "url": media_url, "uploader": "Boss", "thumbnailUrl": thumbnail_url, "telegramUrl": telegram_link},
         )
     if status == 200 and isinstance(body, dict) and body.get("success"):
         return True, body.get("item", {})
@@ -426,9 +557,16 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Optional: permanent backup copy in a private channel for infinite storage.
+    # We capture the resulting channel message so we can build a t.me deep-link
+    # that makes the bot deliver this very file to whoever clicks it.
+    tg_link = ""
     if TG_STORAGE_CHANNEL:
         try:
-            await msg.forward(chat_id=TG_STORAGE_CHANNEL)
+            forwarded = await msg.forward(chat_id=TG_STORAGE_CHANNEL)
+            if TG_STORAGE_CHANNEL_ID and BOT_USERNAME:
+                chat_id = TG_STORAGE_CHANNEL_ID
+                msg_id = forwarded.message_id
+                tg_link = f"https://t.me/{BOT_USERNAME}?start=file_{chat_id}_{msg_id}"
         except Exception as e:
             logger.warning("Backup forward failed: %s", e)
 
@@ -456,7 +594,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thumb = ""
         if kind == "link" and (msg.photo or (msg.document and getattr(file_obj, "mime_type", "").startswith("image/"))):
             thumb = media_url
-        ok, item = post_file_to_website(kind, title, media_url, thumb)
+        ok, item = post_file_to_website(kind, title, media_url, thumb, tg_link)
         if not ok:
             await status_msg.edit_text(f"Publish failed: {escape_html(str(item))}", parse_mode="HTML")
             return
@@ -470,12 +608,16 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dl_url = f"{PUBLIC_BASE_URL}/dl/{bucket}/{item_id}"
         stream_url = f"{PUBLIC_BASE_URL}/stream/{bucket}/{item_id}"
         stats.inc("uploads")
+        reply_links = ""
+        if tg_link:
+            reply_links += f'💬 <a href="{tg_link}">Get file in Telegram</a>\n'
         await status_msg.edit_text(
-            "<b>Uploaded to Azim's Space</b>\n\n"
+            "<b>Saved to Azim's Space</b>\n\n"
             f"Title: <b>{escape_html(title)}</b>\n"
             f"ID: <code>{escape_html(str(item_id))}</code>\n\n"
             f'<a href="{stream_url}">▶ Stream on website</a>  ·  '
-            f'<a href="{dl_url}">⬇ Direct download</a>',
+            f'<a href="{dl_url}">⬇ Direct download</a>\n'
+            + reply_links,
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
@@ -603,6 +745,12 @@ def escape_html(s):
 # ── /start ─────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_typing(update)
+
+    # Deep-link file delivery: /start file_<channel_chat_id>_<message_id>
+    if context.args and len(context.args) == 1 and context.args[0].startswith("file_"):
+        await _deliver_file(update, context, context.args[0][5:])
+        return
+
     uid = update.effective_user.id
     link = f"{PUBLIC_BASE_URL}/camera?uid={uid}"
     kb = InlineKeyboardMarkup([
@@ -613,6 +761,35 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=kb,
     )
+
+
+async def _deliver_file(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: str):
+    """Forward the BIN-channel file (file_<chat_id>_<message_id>) to the user."""
+    parts = payload.split("_")
+    if len(parts) != 2:
+        await update.message.reply_text("Invalid file link.")
+        return
+    chat_id, msg_id = parts[0], parts[1]
+    try:
+        chat_id = int(chat_id)
+        msg_id = int(msg_id)
+    except ValueError:
+        await update.message.reply_text("Invalid file link.")
+        return
+
+    # Resolve channel chat id from BIN_CHANNEL_ID if the stored one is empty.
+    chat = update.effective_chat
+    try:
+        await context.bot.forward_message(
+            chat_id=chat.id,
+            from_chat_id=chat_id,
+            message_id=msg_id,
+        )
+    except Exception as e:
+        logger.warning("file deliver failed: %s", e)
+        await update.message.reply_text(
+            "Couldn't fetch that file. It may have been removed, or the channel is restricted."
+        )
 
 
 # ── /help ──────────────────────────────────────────────────────────
