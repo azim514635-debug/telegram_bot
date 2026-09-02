@@ -545,20 +545,9 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await msg.reply_text(f"Receiving <b>{escape_html(title)}</b>…", parse_mode="HTML")
 
-    # Telegram only lets bots download files up to ~20 MB. Detect ahead of time.
-    file_size = getattr(file_obj, "file_size", 0) or 0
-    if file_size > 20 * 1024 * 1024:
-        await status_msg.edit_text(
-            "<b>File is too big to share here.</b>\n\n"
-            "Use <b>/upload</b> to share the file's link (title + URL) instead — "
-            "there's no size limit that way.",
-            parse_mode="HTML",
-        )
-        return
-
-    # Optional: permanent backup copy in a private channel for infinite storage.
-    # We capture the resulting channel message so we can build a t.me deep-link
-    # that makes the bot deliver this very file to whoever clicks it.
+    # 1) ALWAYS archive a copy in the BIN channel (forwarding never downloads,
+    #    so even huge files work here). We capture the channel message id to
+    #    build a t.me deep-link that re-forwards the file to whoever clicks it.
     tg_link = ""
     if TG_STORAGE_CHANNEL:
         try:
@@ -569,6 +558,39 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tg_link = f"https://t.me/{BOT_USERNAME}?start=file_{chat_id}_{msg_id}"
         except Exception as e:
             logger.warning("Backup forward failed: %s", e)
+        if tg_link:
+            await status_msg.edit_text(
+                "Saved to the archive channel.\n\n"
+                f'💬 <a href="{tg_link}">Get file in Telegram</a>\n\n'
+                "Now publishing a streaming copy…",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+
+    # Telegram only lets bots download files up to ~20 MB. We can forward big
+    # files to the channel, but we cannot pull the bytes to make a web link.
+    file_size = getattr(file_obj, "file_size", 0) or 0
+    too_big = file_size > 20 * 1024 * 1024
+    if too_big:
+        if tg_link:
+            await status_msg.edit_text(
+                "✅ Saved to the archive channel.\n\n"
+                f"Title: <b>{escape_html(title)}</b>\n\n"
+                f'💬 <a href="{tg_link}">Get file in Telegram</a>\n\n'
+                "<i>This file is too large to make a website link (Telegram bot download "
+                "limit), but anyone can open the Telegram link above to receive the file "
+                "directly from the archive channel.</i>",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        else:
+            await status_msg.edit_text(
+                "<b>File is too big to share here.</b>\n\n"
+                "Use <b>/upload</b> to share the file's link (title + URL) instead — "
+                "there's no size limit that way.",
+                parse_mode="HTML",
+            )
+        return
 
     try:
         if not init_cloudinary():
