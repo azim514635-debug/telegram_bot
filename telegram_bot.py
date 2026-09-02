@@ -382,6 +382,17 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await msg.reply_text(f"Receiving <b>{escape_html(title)}</b>…", parse_mode="HTML")
 
+    # Telegram only lets bots download files up to ~20 MB. Detect ahead of time.
+    file_size = getattr(file_obj, "file_size", 0) or 0
+    if file_size > 20 * 1024 * 1024:
+        await status_msg.edit_text(
+            "<b>File is too big to share here.</b>\n\n"
+            "Use <b>/upload</b> to share the file's link (title + URL) instead — "
+            "there's no size limit that way.",
+            parse_mode="HTML",
+        )
+        return
+
     # Optional: permanent backup copy in a private channel for infinite storage.
     if TG_STORAGE_CHANNEL:
         try:
@@ -438,7 +449,16 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.exception("handle_media error")
-        await status_msg.edit_text(f"Error: <code>{escape_html(str(e))}</code>", parse_mode="HTML")
+        msg_text = f"Error: <code>{escape_html(str(e))}</code>"
+        if "too big" in str(e).lower() or "file too large" in str(e).lower():
+            msg_text = (
+                "<b>The file is too large for the bot to download.</b>\n\n"
+                "Use <b>/upload</b> instead and paste the file's link (title + URL)."
+            )
+        try:
+            await status_msg.edit_text(msg_text, parse_mode="HTML")
+        except Exception:
+            await msg.reply_text(msg_text, parse_mode="HTML")
 
 
 # ── /camera ────────────────────────────────────────────────────────
