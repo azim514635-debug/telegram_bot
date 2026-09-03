@@ -895,7 +895,12 @@ async def _relay_via_user_client(client, link_gen_chat_id, telegram_url, req_id)
     Telethon user account, then wait for a reply handled by the event loop."""
     try:
         from telethon import utils as _tu
-        target = link_gen_chat_id if isinstance(link_gen_chat_id, int) else LINK_GENERATOR_BOT
+        # Always target the link generator by USERNAME for the user client so
+        # Telethon can resolve the entity. A raw numeric peer id won't work
+        # unless the client already knows that peer.
+        if not LINK_GENERATOR_BOT:
+            return False, "LINK_GENERATOR_BOT not set"
+        target = LINK_GENERATOR_BOT
 
         from_chat_id = msg_id = None
         if telegram_url and "start=file_" in telegram_url:
@@ -904,10 +909,16 @@ async def _relay_via_user_client(client, link_gen_chat_id, telegram_url, req_id)
             from_chat_id, msg_id = int(parts[0]), int(parts[1])
 
         if from_chat_id and msg_id:
+            # Resolve the source channel so the user client can read/forward it.
+            from_entity = from_chat_id
+            try:
+                from_entity = await client.get_entity(from_chat_id)
+            except Exception:
+                pass
             sent = await client.forward_messages(
                 target,
                 messages=msg_id,
-                from_peer=from_chat_id,
+                from_peer=from_entity,
             )
         else:
             sent = await client.send_message(target, telegram_url or "")
@@ -916,7 +927,7 @@ async def _relay_via_user_client(client, link_gen_chat_id, telegram_url, req_id)
             return False, "relay returned nothing"
 
         # Map the peer we sent to -> this request so the reply handler matches.
-        peer_id = _tu.get_peer_id(target)
+        peer_id = _tu.get_peer_id(await client.get_entity(target))
         _instant_get_reply_map[peer_id] = req_id
         return True, None
     except Exception as e:
