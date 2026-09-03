@@ -1499,6 +1499,26 @@ async def cmd_seturl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── Clear immediate-stop / pending ─────────────────────────────────
+@admin_only
+async def cmd_clearpending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel all stuck pending 'Instant Get File' requests (boss only)."""
+    status, body = api_request(
+        "/api/instant-get/clear-pending", "POST", {"bossSecret": config.boss_secret}
+    )
+    if status == 200 and isinstance(body, dict) and body.get("success"):
+        cleared = body.get("cleared", 0)
+        await update.message.reply_text(
+            f"Cleared <b>{cleared}</b> stuck pending instant-get request(s).",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            f"Couldn't clear pending requests: <code>{escape_html(str(body.get('error', status)))}</code>",
+            parse_mode="HTML",
+        )
+
+
 # ── Reset (delete all uploads) ─────────────────────────────────────
 @admin_only
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1698,6 +1718,7 @@ def register_handlers(app):
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("seturl", cmd_seturl))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("clearpending", cmd_clearpending))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
