@@ -19,6 +19,14 @@ services:
         value: "Azimxyz"
       - key: OWNER_CHAT_ID
         sync: false
+      - key: BOSS_SECRET
+        sync: false
+      - key: BIN_CHANNEL_ID
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: LINK_GENERATOR_BOT
+        sync: false
       - key: CAMERA_POLL_SECONDS
         value: "15"
       - key: PYTHON_VERSION

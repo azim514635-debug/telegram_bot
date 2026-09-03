@@ -132,7 +132,10 @@ class Config:
 
     @property
     def boss_secret(self):
-        return self._data.get("boss_secret", "")
+        # Prefer the BOSS_SECRET env var (set on Render) so the bot always
+        # matches the site; fall back to whatever was stored via /setsecret.
+        return (os.environ.get("BOSS_SECRET") or os.environ.get("ADMIN_SECRET") or
+                self._data.get("boss_secret", ""))
 
     @boss_secret.setter
     def boss_secret(self, value):
@@ -750,6 +753,11 @@ async def secretary_poller(app: Application):
 
             status, body = api_request("/api/instant-get-pending", "GET", boss_secret=config.boss_secret)
             if status != 200 or not isinstance(body, dict):
+                if status == 401:
+                    logger.error(
+                        "Secretary: pending poll unauthorized (status 401). "
+                        "Set BOSS_SECRET env to match the site secret so instant-get works."
+                    )
                 await asyncio.sleep(5)
                 continue
 
