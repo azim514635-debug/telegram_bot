@@ -726,18 +726,28 @@ async def secretary_poller(app: Application):
 
     logger.info("Secretary Mode active — link generator: @%s", LINK_GENERATOR_BOT)
 
-    # Resolve the link generator bot's chat ID once
+    # Resolve the link generator bot's chat ID. If it can't be resolved yet
+    # (bot has no prior chat with it), retry each poll cycle rather than
+    # stopping the poller. The chat must be "introduced" first — see README.
     link_gen_chat_id = None
-    try:
-        chat = await app.bot.get_chat(LINK_GENERATOR_BOT)
-        link_gen_chat_id = chat.id
-        logger.info("Link generator bot resolved: chat_id=%s", link_gen_chat_id)
-    except Exception as e:
-        logger.error("Could not resolve link generator bot @%s: %s", LINK_GENERATOR_BOT, e)
-        return
 
     while True:
         try:
+            # Resolve (or re-resolve) the link generator bot's chat id.
+            if link_gen_chat_id is None:
+                try:
+                    chat = await app.bot.get_chat(LINK_GENERATOR_BOT)
+                    link_gen_chat_id = chat.id
+                    logger.info("Link generator bot resolved: chat_id=%s", link_gen_chat_id)
+                except Exception as e:
+                    logger.warning(
+                        "Secretary: cannot resolve link generator bot @%s yet (%s). "
+                        "Start @%s and forward a file to it first so your bot has a chat with it.",
+                        LINK_GENERATOR_BOT, e, LINK_GENERATOR_BOT,
+                    )
+                    await asyncio.sleep(30)
+                    continue
+
             status, body = api_request("/api/instant-get-pending", "GET", boss_secret=config.boss_secret)
             if status != 200 or not isinstance(body, dict):
                 await asyncio.sleep(5)
