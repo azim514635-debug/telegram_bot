@@ -497,7 +497,6 @@ def _upload_bytes_to_cloudinary(data: bytes, resource_type: str, folder: str):
 
 
 def post_file_to_website(kind: str, title: str, media_url: str, thumbnail_url: str = "", telegram_link: str = ""):
-    """kind: 'movie' | 'song' | 'link' (images/documents become links)."""
     if kind == "movie" or kind == "song":
         status, body = api_request(
             "/api/upload/finalize",
@@ -515,6 +514,47 @@ def post_file_to_website(kind: str, title: str, media_url: str, thumbnail_url: s
     return False, body.get("error", f"HTTP {status}")
 
 
+def _is_boss(update) -> bool:
+    """Whether the sending user is the bot boss/owner (who may publish to the
+    website). Reliable numeric check: OWNER_CHAT_ID or configured owner_id.
+    If no owner is configured, defaults to allow so a solo operator isn't locked out."""
+    user = update.effective_user
+    if not user:
+        return False
+    uid = user.id
+    owner = config.get("owner_id")
+    if owner and str(owner).lstrip("-").isdigit() and int(owner) == uid:
+        return True
+    if OWNER_CHAT_ID and str(OWNER_CHAT_ID).lstrip("-").isdigit() and int(OWNER_CHAT_ID) == uid:
+        return True
+    if not owner and not OWNER_CHAT_ID:
+        return True  # no owner configured — default allow
+    return False
+
+
+async def _build_tg_thumbnail(file_obj):
+    """Extract a Telegram-hosted thumbnail URL for the given media file.
+
+    The file object's native preview (e.g. video.thumbnail) is a PhotoSize;
+    we resolve its file path via bot.get_file and return a public
+    api.telegram.org URL so it can be used as a website thumbnail without
+    downloading the (possibly huge) original.
+    """
+    try:
+        thumb = getattr(file_obj, "thumbnail", None)
+        if not thumb:
+            return ""
+        f = await thumb.get_file()
+        file_path = getattr(f, "file_path", "")
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        if not file_path or not token:
+            return ""
+        return f"https://api.telegram.org/file/bot{token}/{file_path}"
+    except Exception as e:
+        logger.warning("Thumbnail extraction failed: %s", e)
+        return ""
+
+
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.from_user:
@@ -524,39 +564,33 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Pick the real file object + classify the media.
     file_obj = None
-    kind = None
     if msg.photo:
         file_obj = msg.photo[-1]
-        kind = "link"
     elif msg.document:
         file_obj = msg.document
-        kind = "link"
     elif msg.video:
         file_obj = msg.video
-        kind = "movie"
     elif msg.audio or msg.voice:
         file_obj = msg.audio or msg.voice
-        kind = "song"
     elif msg.animation:
         file_obj = msg.animation
-        kind = "link"
 
     if not file_obj:
         await msg.reply_text(
-            "I can turn any <b>document, video, audio or photo</b> into a streaming link.\n"
+            "I can turn any <b>document, video, audio or photo</b> into a link.\n"
             "Just forward or send the file here.",
             parse_mode="HTML",
         )
         return
 
+    # Use the original file name (or caption) as the title.
     file_name = getattr(file_obj, "file_name", None) or ""
     title = (msg.caption or file_name or "Boss Upload").strip().splitlines()[0][:80] or "Boss Upload"
 
     status_msg = await msg.reply_text(f"Receiving <b>{escape_html(title)}</b>…", parse_mode="HTML")
 
-    # 1) ALWAYS archive a copy in the BIN channel (forwarding never downloads,
-    #    so even huge files work here). We capture the channel message id to
-    #    build a t.me deep-link that re-forwards the file to whoever clicks it.
+    # 1) ALWAYS archive a copy in the BIN channel. Capturing the channel
+    #    message id lets us build a deep-link the website can re-forward.
     tg_link = ""
     if TG_STORAGE_CHANNEL:
         try:
@@ -565,105 +599,57 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id = TG_STORAGE_CHANNEL_ID
                 msg_id = forwarded.message_id
                 tg_link = f"https://t.me/{BOT_USERNAME}?start=file_{chat_id}_{msg_id}"
+            if tg_link or not TG_STORAGE_CHANNEL_ID:
+                await status_msg.edit_text(
+                    "Saved to the archive channel.\n\n"
+                    f'💬 <a href="{tg_link}">Get file in Telegram</a>\n\n'
+                    "Preparing website card…",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
         except Exception as e:
             logger.warning("Backup forward failed: %s", e)
-        if tg_link:
-            await status_msg.edit_text(
-                "Saved to the archive channel.\n\n"
-                f'💬 <a href="{tg_link}">Get file in Telegram</a>\n\n'
-                "Now publishing a streaming copy…",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
 
-    # Telegram only lets bots download files up to ~20 MB. We can forward big
-    # files to the channel, but we cannot pull the bytes to make a web link.
-    file_size = getattr(file_obj, "file_size", 0) or 0
-    too_big = file_size > 20 * 1024 * 1024
-    if too_big:
-        if tg_link:
-            await status_msg.edit_text(
-                "✅ Saved to the archive channel.\n\n"
-                f"Title: <b>{escape_html(title)}</b>\n\n"
-                f'💬 <a href="{tg_link}">Get file in Telegram</a>\n\n'
-                "<i>This file is too large to make a website link (Telegram bot download "
-                "limit), but anyone can open the Telegram link above to receive the file "
-                "directly from the archive channel.</i>",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        else:
-            await status_msg.edit_text(
-                "<b>File is too big to share here.</b>\n\n"
-                "Use <b>/upload</b> to share the file's link (title + URL) instead — "
-                "there's no size limit that way.",
-                parse_mode="HTML",
-            )
-        return
+    # 2) Resolve the native thumbnail (no full download needed).
+    await status_msg.edit_text(
+        "Building website card…",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    thumb = await _build_tg_thumbnail(file_obj)
 
-    try:
-        if not init_cloudinary():
-            await status_msg.edit_text("Storage not configured (missing CLOUDINARY_URL).")
-            return
-        raw = await (await file_obj.get_file()).download_as_bytearray()
-        if not raw:
-            await status_msg.edit_text("Could not download the file. Try again.")
-            return
-
-        await status_msg.edit_text("Uploading to storage…")
-        if kind == "movie" or kind == "song":
-            media_url = await asyncio.to_thread(_upload_bytes_to_cloudinary, bytes(raw), "video", "azim_tg")
-        elif kind == "link" and (msg.photo or (msg.document and getattr(file_obj, "mime_type", "").startswith("image/"))):
-            media_url = await asyncio.to_thread(_upload_bytes_to_cloudinary, bytes(raw), "image", "azim_tg")
-        else:
-            media_url = await asyncio.to_thread(_upload_bytes_to_cloudinary, bytes(raw), "raw", "azim_tg")
-        if not media_url:
-            await status_msg.edit_text("Upload failed. Cloudinary did not return a URL.")
-            return
-
-        await status_msg.edit_text("Publishing to the Updates feed…")
-        thumb = ""
-        if kind == "link" and (msg.photo or (msg.document and getattr(file_obj, "mime_type", "").startswith("image/"))):
-            thumb = media_url
-        ok, item = post_file_to_website(kind, title, media_url, thumb, tg_link)
-        if not ok:
-            await status_msg.edit_text(f"Publish failed: {escape_html(str(item))}", parse_mode="HTML")
-            return
-
-        bucket = {
-            "movie": "video",
-            "song": "audio",
-            "link": "file",
-        }.get(kind, "file")
-        item_id = item.get("id", "")
-        dl_url = f"{PUBLIC_BASE_URL}/dl/{bucket}/{item_id}"
-        stream_url = f"{PUBLIC_BASE_URL}/stream/{bucket}/{item_id}"
-        stats.inc("uploads")
-        reply_links = ""
-        if tg_link:
-            reply_links += f'💬 <a href="{tg_link}">Get file in Telegram</a>\n'
+    # 3) Only the BOSS's forwards are published to the website. Any other
+    #    user only receives the Telegram deep-link (the file is still archived
+    #    to the BIN channel so the deep-link works for everyone).
+    is_boss_sender = _is_boss(update)
+    if not is_boss_sender:
         await status_msg.edit_text(
-            "<b>Saved to Azim's Space</b>\n\n"
-            f"Title: <b>{escape_html(title)}</b>\n"
-            f"ID: <code>{escape_html(str(item_id))}</code>\n\n"
-            f'<a href="{stream_url}">▶ Stream on website</a>  ·  '
-            f'<a href="{dl_url}">⬇ Direct download</a>\n'
-            + reply_links,
+            "✅ Link ready.\n\n"
+            f"Title: <b>{escape_html(title)}</b>\n\n"
+            f'💬 <a href="{tg_link}">Get file in Telegram</a>',
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
-    except Exception as e:
-        logger.exception("handle_media error")
-        msg_text = f"Error: <code>{escape_html(str(e))}</code>"
-        if "too big" in str(e).lower() or "file too large" in str(e).lower():
-            msg_text = (
-                "<b>The file is too large for the bot to download.</b>\n\n"
-                "Use <b>/upload</b> instead and paste the file's link (title + URL)."
-            )
-        try:
-            await status_msg.edit_text(msg_text, parse_mode="HTML")
-        except Exception:
-            await msg.reply_text(msg_text, parse_mode="HTML")
+        return
+
+    # 4) Publish to the website as a LINK item. The stored URL is the
+    #    Telegram deep-link, so Button 1 opens it and Button 2 (Instant Get)
+    #    can re-forward the same file to the link generator bot.
+    ok, item = post_file_to_website("link", title, tg_link or "", thumb, tg_link)
+    if not ok:
+        await status_msg.edit_text(f"Publish failed: {escape_html(str(item))}", parse_mode="HTML")
+        return
+
+    stats.inc("uploads")
+    item_id = item.get("id", "")
+    await status_msg.edit_text(
+        "<b>Saved to Azim's Space</b>\n\n"
+        f"Title: <b>{escape_html(title)}</b>\n"
+        f"ID: <code>{escape_html(str(item_id))}</code>\n\n"
+        f'💬 <a href="{tg_link}">Get file in Telegram</a>',
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 # ── /camera ────────────────────────────────────────────────────────
@@ -1601,27 +1587,6 @@ async def post_init(app: Application):
     asyncio.create_task(secretary_poller(app))
     logger.info("Secretary Mode loop started.")
 
-    # Keep-alive to prevent Render free-tier spin-down after ~15 min of
-    # inactivity. Runs inside the event loop (post_init) so to_async /
-    # create_task are safe. Falls back to the website /healthz when no
-    # RENDER_EXTERNAL_URL is set (webhook mode).
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-    target = (render_url.rstrip("/") + "/webhook") if render_url else (
-        (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("SITE_BASE_URL") or "").rstrip("/") + "/healthz"
-    )
-    if target and target.startswith("http"):
-        async def _keepalive():
-            import urllib.request as _ur
-            await asyncio.sleep(30)
-            while True:
-                try:
-                    _ur.urlopen(_ur.Request(target, method="GET"), timeout=10)
-                except Exception:
-                    pass
-                await asyncio.sleep(4 * 60)
-        asyncio.create_task(_keepalive())
-        logger.info("Keep-alive pinging %s every 4m.", target)
-
 
 # ── Main ───────────────────────────────────────────────────────────
 def load_token():
@@ -1738,6 +1703,20 @@ def main():
         webhook_url = render_url.rstrip("/") + "/webhook"
         logger.info(f"Starting in webhook mode: {webhook_url}")
         print(f"Bot running in webhook mode on {render_url}")
+
+        # Keep-alive: ping our own webhook every 4 min to prevent Render
+        # free-tier spin-down after ~15 min of inactivity.
+        async def _keepalive():
+            await asyncio.sleep(30)
+            while True:
+                try:
+                    req = urllib.request.Request(webhook_url, method="GET")
+                    urllib.request.urlopen(req, timeout=10)
+                except Exception:
+                    pass
+                await asyncio.sleep(4 * 60)
+        asyncio.create_task(_keepalive())
+        logger.info("Keep-alive pinging %s every 4m.", webhook_url)
 
         app.run_webhook(
             listen="0.0.0.0",
