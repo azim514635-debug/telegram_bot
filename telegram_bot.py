@@ -1601,6 +1601,25 @@ async def post_init(app: Application):
     asyncio.create_task(secretary_poller(app))
     logger.info("Secretary Mode loop started.")
 
+    # Keep-alive to prevent Render free-tier spin-down after ~15 min of
+    # inactivity. Runs inside the event loop (post_init) so create_task is safe.
+    _render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+    _target = (_render_url.rstrip("/") + "/webhook") if _render_url else (
+        (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("SITE_BASE_URL") or "").rstrip("/") + "/healthz"
+    )
+    if _target and _target.startswith("http"):
+        import urllib.request as _ur
+        async def _keepalive():
+            await asyncio.sleep(30)
+            while True:
+                try:
+                    _ur.urlopen(_ur.Request(_target, method="GET"), timeout=10)
+                except Exception:
+                    pass
+                await asyncio.sleep(4 * 60)
+        asyncio.create_task(_keepalive())
+        logger.info("Keep-alive pinging %s every 4m.", _target)
+
 
 # ── Main ───────────────────────────────────────────────────────────
 def load_token():
@@ -1717,20 +1736,6 @@ def main():
         webhook_url = render_url.rstrip("/") + "/webhook"
         logger.info(f"Starting in webhook mode: {webhook_url}")
         print(f"Bot running in webhook mode on {render_url}")
-
-        # Keep-alive: ping our own webhook every 4 min to prevent Render
-        # free-tier spin-down after ~15 min of inactivity.
-        async def _keepalive():
-            await asyncio.sleep(30)
-            while True:
-                try:
-                    req = urllib.request.Request(webhook_url, method="GET")
-                    urllib.request.urlopen(req, timeout=10)
-                except Exception:
-                    pass
-                await asyncio.sleep(4 * 60)
-        asyncio.create_task(_keepalive())
-        logger.info("Keep-alive pinging %s every 4m.", webhook_url)
 
         app.run_webhook(
             listen="0.0.0.0",
