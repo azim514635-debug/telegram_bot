@@ -33,3 +33,27 @@ python telegram_bot.py
 | `/stats` | View statistics |
 | `/setsecret` | Set boss secret |
 | `/cancel` | Cancel operation |
+
+## Secretary Mode (Instant Get File)
+
+When a visitor clicks **"Instant Get File"** on the website, the bot forwards the
+same file to a third-party link-generator bot, parses the download URL from its
+reply, and sends it to the website user.
+
+### Setup (important)
+
+1. Set `LINK_GENERATOR_BOT` to the @username (no `@`) of your link generator bot.
+2. **Introduce the two bots** — your bot can only send files to the link
+   generator bot once they share a chat. Do this once from your Telegram:
+   - Open the link generator bot (@File_To_Link_2Bot) → press **Start** → send a
+     test file so it replies.
+   - Forward a message from your own bot into the link generator bot's chat (or
+     forward the link generator bot's reply into your bot's chat).
+3. Also set on Render: `BIN_CHANNEL_ID` (numeric channel id) and `BOT_USERNAME`
+   for the deep-link "Get file in Telegram" button.
+
+### Boss-only uploads
+
+Only the BOSS (set by `OWNER_CHAT_ID` or `/setowner`) is allowed to publish
+forwarded files to the website. Any other user forwarding a file only receives
+the Telegram deep-link — their files are never uploaded to your website.
