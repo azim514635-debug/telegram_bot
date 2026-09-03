@@ -852,23 +852,27 @@ async def handle_link_gen_reply(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Look for HTTP/HTTPS URLs in the message
     urls = re.findall(r'https?://[^\s<>\"\']+', text)
-    # Filter for download-like URLs (skip telegram t.me links)
+    # Filter for download-like URLs (skip telegram t.me links). Prefer the
+    # direct download link (e.g. contains /dl/ or /download) over a watch/stream
+    # URL if both appear in the reply.
     download_urls = [u for u in urls if not u.startswith("https://t.me/")]
     if download_urls:
-        result_url = download_urls[0]
+        dl_candidates = [u for u in download_urls if "/dl/" in u or "/download" in u.lower()]
+        result_url = (dl_candidates or download_urls)[0]
 
     # Also check for buttons (inline keyboard)
     if not result_url and msg.reply_markup:
         try:
             from telegram import InlineKeyboardMarkup
             if isinstance(msg.reply_markup, InlineKeyboardMarkup):
+                btn_urls = []
                 for row in msg.reply_markup.inline_keyboard:
                     for btn in row:
                         if btn.url and not btn.url.startswith("https://t.me/"):
-                            result_url = btn.url
-                            break
-                    if result_url:
-                        break
+                            btn_urls.append(btn.url)
+                if btn_urls:
+                    dl_btns = [u for u in btn_urls if "/dl/" in u or "/download" in u.lower()]
+                    result_url = (dl_btns or btn_urls)[0]
         except Exception:
             pass
 
