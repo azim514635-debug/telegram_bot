@@ -81,6 +81,15 @@ CAMERA_POLL_SECONDS = int(os.environ.get("CAMERA_POLL_SECONDS", "15"))
 ENDPOINT = "/api/upload/link-item"
 CONFIG_FILE = Path(__file__).parent / "bot_config.json"
 STATS_FILE = Path(__file__).parent / "bot_stats.json"
+LINK_GENERATOR_BOT = os.environ.get("LINK_GENERATOR_BOT", "").strip().lstrip("@")
+
+# Secretary Mode — pending instant-get requests
+# {request_id: asyncio.Event}
+_pending_instant_gets: dict = {}
+# {chat_id (link gen bot): request_id} — tracks which request each reply belongs to
+_instant_get_reply_map: dict = {}
+# Timeout for waiting for link generator bot reply (seconds)
+INSTANT_GET_TIMEOUT = 60
 
 # Conversation states
 WAIT_TITLE, WAIT_URL, WAIT_THUMBNAIL, WAIT_CONFIRM = range(4)
@@ -717,6 +726,167 @@ async def camera_poller(app: Application):
         except Exception as e:
             logger.warning("camera_poller error: %s", e)
         await asyncio.sleep(CAMERA_POLL_SECONDS)
+
+
+# ── Secretary Mode: Instant Get link extraction ────────────────────
+async def secretary_poller(app: Application):
+    """Polls the website API for pending instant-get requests, forwards
+    the movie to the link generator bot, and waits for the reply."""
+    await asyncio.sleep(10)
+
+    if not LINK_GENERATOR_BOT:
+        logger.info("Secretary Mode disabled (LINK_GENERATOR_BOT not set).")
+        return
+
+    logger.info("Secretary Mode active — link generator: @%s", LINK_GENERATOR_BOT)
+
+    # Resolve the link generator bot's chat ID once
+    link_gen_chat_id = None
+    try:
+        chat = await app.bot.get_chat(LINK_GENERATOR_BOT)
+        link_gen_chat_id = chat.id
+        logger.info("Link generator bot resolved: chat_id=%s", link_gen_chat_id)
+    except Exception as e:
+        logger.error("Could not resolve link generator bot @%s: %s", LINK_GENERATOR_BOT, e)
+        return
+
+    while True:
+        try:
+            status, body = api_request("/api/instant-get-pending", "GET", boss_secret=config.boss_secret)
+            if status != 200 or not isinstance(body, dict):
+                await asyncio.sleep(5)
+                continue
+
+            for req in body.get("requests", []):
+                req_id = req.get("id", "")
+                movie_url = req.get("movieUrl", "")
+                movie_title = req.get("movieTitle", "Untitled")
+                telegram_url = req.get("telegramUrl", "")
+
+                if not req_id or not movie_url:
+                    continue
+
+                logger.info("Secretary: processing instant-get for '%s' (id=%s)", movie_title, req_id)
+
+                # Try to forward the movie to the link generator bot
+                try:
+                    # If we have a telegramUrl, extract the channel message and forward it
+                    forwarded_msg = None
+                    if telegram_url and "start=file_" in telegram_url:
+                        try:
+                            payload = telegram_url.split("start=file_")[1]
+                            parts = payload.split("_")
+                            from_chat_id = int(parts[0])
+                            message_id = int(parts[1])
+                            forwarded_msg = await app.bot.forward_message(
+                                chat_id=link_gen_chat_id,
+                                from_chat_id=from_chat_id,
+                                message_id=message_id,
+                            )
+                        except Exception as e:
+                            logger.warning("Secretary: forward from channel failed: %s", e)
+
+                    # If forward failed, try sending the URL as text
+                    if not forwarded_msg:
+                        forwarded_msg = await app.bot.send_message(
+                            chat_id=link_gen_chat_id,
+                            text=movie_url,
+                        )
+
+                    if not forwarded_msg:
+                        raise Exception("Could not send file to link generator bot")
+
+                    # Register this request so the reply handler can find it
+                    reply_chat_id = forwarded_msg.chat.id
+                    _instant_get_reply_map[reply_chat_id] = req_id
+                    _pending_instant_gets[req_id] = asyncio.Event()
+
+                    # Wait for the reply (with timeout)
+                    try:
+                        await asyncio.wait_for(
+                            _pending_instant_gets[req_id].wait(),
+                            timeout=INSTANT_GET_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("Secretary: timeout waiting for reply for %s", req_id)
+                        await _update_instant_result(req_id, "timeout", None, "Link generator bot did not reply in time")
+                    finally:
+                        _pending_instant_gets.pop(req_id, None)
+                        _instant_get_reply_map.pop(reply_chat_id, None)
+
+                except Exception as e:
+                    logger.exception("Secretary: error processing instant-get %s", req_id)
+                    await _update_instant_result(req_id, "error", None, str(e))
+
+        except Exception as e:
+            logger.warning("secretary_poller error: %s", e)
+        await asyncio.sleep(5)
+
+
+async def _update_instant_result(req_id, status, result_url=None, error=None):
+    """Update an instant-get request result via the website API."""
+    data = {"requestId": req_id, "status": status}
+    if result_url:
+        data["resultUrl"] = result_url
+    if error:
+        data["error"] = error
+    api_request("/api/instant-get-result", "POST", data, config.boss_secret)
+
+
+async def handle_link_gen_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catch replies from the link generator bot and extract download URLs."""
+    msg = update.effective_message
+    if not msg or not msg.from_user:
+        return
+
+    # Only process messages from the link generator bot
+    if msg.from_user.username and msg.from_user.username.lower() != LINK_GENERATOR_BOT.lower():
+        return
+
+    chat_id = msg.chat.id
+    req_id = _instant_get_reply_map.get(chat_id)
+    if not req_id:
+        return
+
+    logger.info("Secretary: got reply from link generator for request %s", req_id)
+
+    # Parse the download URL from the reply
+    result_url = None
+    text = msg.text or msg.caption or ""
+
+    # Look for HTTP/HTTPS URLs in the message
+    urls = re.findall(r'https?://[^\s<>\"\']+', text)
+    # Filter for download-like URLs (skip telegram t.me links)
+    download_urls = [u for u in urls if not u.startswith("https://t.me/")]
+    if download_urls:
+        result_url = download_urls[0]
+
+    # Also check for buttons (inline keyboard)
+    if not result_url and msg.reply_markup:
+        try:
+            from telegram import InlineKeyboardMarkup
+            if isinstance(msg.reply_markup, InlineKeyboardMarkup):
+                for row in msg.reply_markup.inline_keyboard:
+                    for btn in row:
+                        if btn.url and not btn.url.startswith("https://t.me/"):
+                            result_url = btn.url
+                            break
+                    if result_url:
+                        break
+        except Exception:
+            pass
+
+    if result_url:
+        await _update_instant_result(req_id, "done", result_url)
+        event = _pending_instant_gets.get(req_id)
+        if event:
+            event.set()
+    else:
+        # No URL found — mark as done but with the full text for debugging
+        await _update_instant_result(req_id, "done", None, "No download URL found in reply")
+        event = _pending_instant_gets.get(req_id)
+        if event:
+            event.set()
 
 
 # ── UI helpers ─────────────────────────────────────────────────────
@@ -1428,6 +1598,8 @@ async def post_init(app: Application):
     logger.info("Bot commands registered.")
     asyncio.create_task(camera_poller(app))
     logger.info("Camera delivery loop started.")
+    asyncio.create_task(secretary_poller(app))
+    logger.info("Secretary Mode loop started.")
 
 
 # ── Main ───────────────────────────────────────────────────────────
@@ -1511,6 +1683,13 @@ def register_handlers(app):
     )
     app.add_handler(MessageHandler(MEDIA_FILTER, handle_media))
 
+    # Secretary Mode: catch replies from the link generator bot
+    if LINK_GENERATOR_BOT:
+        app.add_handler(MessageHandler(
+            filters.ChatType.PRIVATE & ~filters.COMMAND,
+            handle_link_gen_reply,
+        ))
+
     # Catch-all text messages for conversation flow
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -1538,6 +1717,21 @@ def main():
         webhook_url = render_url.rstrip("/") + "/webhook"
         logger.info(f"Starting in webhook mode: {webhook_url}")
         print(f"Bot running in webhook mode on {render_url}")
+
+        # Keep-alive: ping our own webhook every 4 min to prevent Render
+        # free-tier spin-down after ~15 min of inactivity.
+        async def _keepalive():
+            await asyncio.sleep(30)
+            while True:
+                try:
+                    req = urllib.request.Request(webhook_url, method="GET")
+                    urllib.request.urlopen(req, timeout=10)
+                except Exception:
+                    pass
+                await asyncio.sleep(4 * 60)
+        asyncio.create_task(_keepalive())
+        logger.info("Keep-alive pinging %s every 4m.", webhook_url)
+
         app.run_webhook(
             listen="0.0.0.0",
             port=port,
