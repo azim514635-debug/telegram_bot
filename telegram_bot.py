@@ -751,18 +751,40 @@ async def secretary_poller(app: Application):
         try:
             # Resolve (or re-resolve) the link generator bot's chat id.
             if link_gen_chat_id is None:
+                # 1) Prefer an explicit numeric chat id from env.
+                env_chat = (os.environ.get("LINK_GENERATOR_CHAT_ID") or "").strip().lstrip("@")
+                if env_chat and env_chat.lstrip("-").isdigit():
+                    link_gen_chat_id = int(env_chat)
+                    logger.info("Link generator chat id from env: %s", link_gen_chat_id)
+                    continue
+                # 2) Try resolving by username.
                 try:
                     chat = await app.bot.get_chat(LINK_GENERATOR_BOT)
                     link_gen_chat_id = chat.id
                     logger.info("Link generator bot resolved: chat_id=%s", link_gen_chat_id)
                 except Exception as e:
-                    logger.warning(
-                        "Secretary: cannot resolve link generator bot @%s yet (%s). "
-                        "Start @%s and forward a file to it first so your bot has a chat with it.",
-                        LINK_GENERATOR_BOT, e, LINK_GENERATOR_BOT,
-                    )
-                    await asyncio.sleep(30)
-                    continue
+                    # Fallback: send a message directly to the link generator by
+                    # username. This auto-creates a chat between the two bots, so
+                    # we can read the chat.id from the sent message — no manual
+                    # forwarding needed.
+                    try:
+                        hello = await app.bot.send_message(
+                            LINK_GENERATOR_BOT,
+                            "🟢 Link relay chat established.",
+                        )
+                        link_gen_chat_id = hello.chat.id
+                        logger.info(
+                            "Link generator chat auto-created by direct message: chat_id=%s",
+                            link_gen_chat_id,
+                        )
+                    except Exception as e2:
+                        logger.warning(
+                            "Secretary: cannot resolve link generator bot @%s yet (%s). "
+                            "Start @%s and forward a file to it first so your bot has a chat with it.",
+                            LINK_GENERATOR_BOT, e, LINK_GENERATOR_BOT,
+                        )
+                        await asyncio.sleep(30)
+                        continue
 
             status, body = api_request("/api/instant-get-pending", "GET", boss_secret=config.boss_secret)
             if status != 200 or not isinstance(body, dict):

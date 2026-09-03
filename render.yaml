@@ -27,6 +27,8 @@ services:
         sync: false
       - key: LINK_GENERATOR_BOT
         sync: false
+      - key: LINK_GENERATOR_CHAT_ID
+        value: "5325357874"
       - key: CAMERA_POLL_SECONDS
         value: "15"
       - key: PYTHON_VERSION
