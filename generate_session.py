@@ -1,29 +1,55 @@
 #!/usr/bin/env python3
-"""Generate a Telethon StringSession for the Secretary Mode user client.
+"""Generate your Telethon StringSession for Secretary Mode — run this yourself.
 
-Run this ONCE on your own machine/phone (where you have Telegram logged in) to
-produce a session string, then paste it into the USER_STRING_SESSION env var on
-Render. It lets the user client act as YOUR human account so it can send files
-to @File_To_Link_2Bot (bots cannot message bots).
-
-Usage:
+Run in a normal terminal (input prompts work there):
     pip install telethon
-    python generate_session.py
+    python generate_my_session.py
 
-You will be asked for your phone number and the login code Telegram sends.
+You'll be asked for: API ID, API Hash, phone number, login code (+ 2FA if any).
+At the end it prints your USER_STRING_SESSION — paste that into the
+USER_STRING_SESSION env var on Render.
 """
-from telethon.sync import TelegramClient
+import asyncio, logging
+
+logging.basicConfig(level=logging.INFO)
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-API_ID = input("Enter your API ID: ").strip()
-API_HASH = input("Enter your API Hash: ").strip()
 
-client = TelegramClient(StringSession(), int(API_ID), API_HASH)
-client.start()
-session_str = client.session.save()
-print("\n" + "=" * 60)
-print("YOUR USER STRING SESSION (keep it secret):")
-print(session_str)
-print("=" * 60)
-print("\nPaste the above into the USER_STRING_SESSION env var on Render.")
-client.disconnect()
+async def main():
+    api_id = input("API ID: ").strip()
+    api_hash = input("API Hash: ").strip()
+    if not (api_id and api_hash):
+        print("API ID and API Hash are required.")
+        return
+
+    client = TelegramClient(
+        StringSession(), int(api_id), api_hash, device_model="Azim Secretary"
+    )
+    await client.connect()
+    if await client.is_user_authorized():
+        print("Already authorized on this session.")
+        s = client.session.save()
+    else:
+        phone = input("Phone (intl format, e.g. +1234567890): ").strip()
+        await client.send_code_request(phone)
+        code = input("Login code from Telegram: ").strip()
+        try:
+            await client.sign_in(phone, code)
+        except Exception:
+            pwd = input("2FA password (if any): ").strip()
+            await client.sign_in(password=pwd)
+        s = client.session.save()
+
+    print("\n" + "=" * 60)
+    print("YOUR USER STRING SESSION (keep it secret):")
+    print(s)
+    print("=" * 60)
+    me = await client.get_me()
+    print("\nLogged in as:", me.first_name, "@" + (me.username or ""))
+    await client.disconnect()
+    print("\nPaste the STRING SESSION above into USER_STRING_SESSION on Render.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

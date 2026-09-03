@@ -670,10 +670,25 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Saved to Azim's Space</b>\n\n"
         f"Title: <b>{escape_html(title)}</b>\n"
         f"ID: <code>{escape_html(str(item_id))}</code>\n\n"
-        f'💬 <a href="{tg_link}">Get file in Telegram</a>',
+        f'💬 <a href="{tg_link}">Get file in Telegram</a>\n'
+        "⚡ Generating instant download link…",
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
+
+    # Auto-trigger instant-get so the download link is ready before anyone
+    # clicks the Instant Get button.  The secretary_poller will pick it up.
+    if item_id and tg_link:
+        try:
+            api_request(
+                "/api/instant-get",
+                "POST",
+                {"movieId": item_id},
+                boss_secret=config.boss_secret,
+            )
+            logger.info("Auto-triggered instant-get for '%s' (id=%s)", title, item_id)
+        except Exception as e:
+            logger.warning("Auto instant-get trigger failed for '%s': %s", title, e)
 
 
 # ── /camera ────────────────────────────────────────────────────────
@@ -1773,8 +1788,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Link expiry checker (background loop) ──────────────────────────
 async def _link_expiry_checker(app: Application):
-    """Every 2 hours, check for movies whose resolved link has expired and
-    regenerate them by creating fresh instant-get requests."""
+    """Every 2 hours, check for movies/links whose resolved link has expired
+    and regenerate them by creating fresh instant-get requests."""
     await asyncio.sleep(30)  # let secretary_poller start first
     while True:
         await asyncio.sleep(2 * 60 * 60)  # 2 hours
@@ -1786,11 +1801,11 @@ async def _link_expiry_checker(app: Application):
             )
             if status != 200 or not isinstance(body, dict):
                 continue
-            movies = body.get("movies", [])
-            if not movies:
+            items = body.get("movies", [])
+            if not items:
                 continue
-            logger.info("Link expiry checker: regenerating %d expired links.", len(movies))
-            for m in movies:
+            logger.info("Link expiry checker: regenerating %d expired links.", len(items))
+            for m in items:
                 movie_id = m.get("id")
                 title = m.get("title", "Unknown")
                 tg_url = m.get("telegramUrl", "")
