@@ -536,12 +536,13 @@ def _is_boss(update) -> bool:
 
 
 async def _build_tg_thumbnail(file_obj):
-    """Extract a Telegram-hosted thumbnail URL for the given media file.
+    """Return a durable, public thumbnail URL for the given media file.
 
-    The file object's native preview (e.g. video.thumbnail) is a PhotoSize;
-    we resolve its file path via bot.get_file and return a public
-    api.telegram.org URL so it can be used as a website thumbnail without
-    downloading the (possibly huge) original.
+    The file object's native preview (e.g. video.thumbnail) is a PhotoSize.
+    We resolve its file path via bot.get_file and upload the (small) thumbnail
+    to Cloudinary so the website gets a stable, public URL that does not leak
+    the bot token. Falls back to an idempotent api.telegram.org URL when
+    Cloudinary is unavailable.
     """
     try:
         thumb = getattr(file_obj, "thumbnail", None)
@@ -552,6 +553,18 @@ async def _build_tg_thumbnail(file_obj):
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         if not file_path or not token:
             return ""
+        if "api.telegram.org/file/" in file_path:
+            file_path = file_path.split("api.telegram.org/file/", 1)[1]
+
+        c_url = CLOUDINARY_URL
+        if c_url:
+            bytes_data = f.download_as_bytearray()
+            if bytes_data:
+                init_cloudinary()
+                secure = _upload_bytes_to_cloudinary(bytes(bytes_data), "image", "thumbnails")
+                if secure:
+                    return secure
+
         return f"https://api.telegram.org/file/bot{token}/{file_path}"
     except Exception as e:
         logger.warning("Thumbnail extraction failed: %s", e)
