@@ -1,2 +1,3 @@
 python-telegram-bot[ext]==21.6
 cloudinary==1.41.0
+telethon==1.36.0

@@ -83,11 +83,19 @@ CONFIG_FILE = Path(__file__).parent / "bot_config.json"
 STATS_FILE = Path(__file__).parent / "bot_stats.json"
 LINK_GENERATOR_BOT = os.environ.get("LINK_GENERATOR_BOT", "").strip().lstrip("@")
 
+# Telecom user-client (Telethon) credentials — lets us talk to the link
+# generator bot as a human (bots cannot message bots: User_bot_to_bot_disabled).
+USER_API_ID = (os.environ.get("API_ID") or os.environ.get("USER_API_ID") or "").strip()
+USER_API_HASH = (os.environ.get("API_HASH") or os.environ.get("USER_API_HASH") or "").strip()
+USER_STRING_SESSION = (os.environ.get("USER_STRING_SESSION") or "").strip()
+
 # Secretary Mode — pending instant-get requests
 # {request_id: asyncio.Event}
 _pending_instant_gets: dict = {}
 # {chat_id (link gen bot): request_id} — tracks which request each reply belongs to
 _instant_get_reply_map: dict = {}
+# Telethon user client (shared) — used to talk to the link generator bot as a human
+_user_client = None
 # Timeout for waiting for link generator bot reply (seconds)
 INSTANT_GET_TIMEOUT = 60
 
@@ -731,9 +739,32 @@ async def camera_poller(app: Application):
 
 
 # ── Secretary Mode: Instant Get link extraction ────────────────────
+def _get_user_client():
+    """Build (and start) a Telethon user client from the configured API
+    credentials. Returns None if not configured. The user client acts as the
+    human account so it CAN send files to the link generator bot (bots cannot
+    message bots: User_bot_to_bot_disabled)."""
+    global _user_client
+    if _user_client is not None:
+        return _user_client
+    if not (USER_API_ID and USER_API_HASH):
+        logger.warning("Secretary: no API_ID/API_HASH set — user client disabled.")
+        return None
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        session = StringSession(USER_STRING_SESSION) if USER_STRING_SESSION else None
+        client = TelegramClient(session, int(USER_API_ID), USER_API_HASH)
+        _user_client = client
+        return client
+    except Exception as e:
+        logger.error("Secretary: failed to build user client: %s", e)
+        return None
+
+
 async def secretary_poller(app: Application):
-    """Polls the website API for pending instant-get requests, forwards
-    the movie to the link generator bot, and waits for the reply."""
+    """Polls the website API for pending instant-get requests, relays the
+    movie to the link generator bot, and waits for the reply."""
     await asyncio.sleep(10)
 
     if not LINK_GENERATOR_BOT:
@@ -742,50 +773,14 @@ async def secretary_poller(app: Application):
 
     logger.info("Secretary Mode active — link generator: @%s", LINK_GENERATOR_BOT)
 
-    # Resolve the link generator bot's chat ID. If it can't be resolved yet
-    # (bot has no prior chat with it), retry each poll cycle rather than
-    # stopping the poller. The chat must be "introduced" first — see README.
-    link_gen_chat_id = None
+    # Try to bring up the user client; fall back to the bot if unavailable.
+    user_client = await start_user_client()
+    use_user = user_client is not None
+
+    link_gen_chat_id = _resolve_link_gen_chat_id(user_client if use_user else app.bot)
 
     while True:
         try:
-            # Resolve (or re-resolve) the link generator bot's chat id.
-            if link_gen_chat_id is None:
-                # 1) Prefer an explicit numeric chat id from env.
-                env_chat = (os.environ.get("LINK_GENERATOR_CHAT_ID") or "").strip().lstrip("@")
-                if env_chat and env_chat.lstrip("-").isdigit():
-                    link_gen_chat_id = int(env_chat)
-                    logger.info("Link generator chat id from env: %s", link_gen_chat_id)
-                    continue
-                # 2) Try resolving by username.
-                try:
-                    chat = await app.bot.get_chat(LINK_GENERATOR_BOT)
-                    link_gen_chat_id = chat.id
-                    logger.info("Link generator bot resolved: chat_id=%s", link_gen_chat_id)
-                except Exception as e:
-                    # Fallback: send a message directly to the link generator by
-                    # username. This auto-creates a chat between the two bots, so
-                    # we can read the chat.id from the sent message — no manual
-                    # forwarding needed.
-                    try:
-                        hello = await app.bot.send_message(
-                            LINK_GENERATOR_BOT,
-                            "🟢 Link relay chat established.",
-                        )
-                        link_gen_chat_id = hello.chat.id
-                        logger.info(
-                            "Link generator chat auto-created by direct message: chat_id=%s",
-                            link_gen_chat_id,
-                        )
-                    except Exception as e2:
-                        logger.warning(
-                            "Secretary: cannot resolve link generator bot @%s yet (%s). "
-                            "Start @%s and forward a file to it first so your bot has a chat with it.",
-                            LINK_GENERATOR_BOT, e, LINK_GENERATOR_BOT,
-                        )
-                        await asyncio.sleep(30)
-                        continue
-
             status, body = api_request("/api/instant-get-pending", "GET", boss_secret=config.boss_secret)
             if status != 200 or not isinstance(body, dict):
                 if status == 401:
@@ -807,59 +802,126 @@ async def secretary_poller(app: Application):
 
                 logger.info("Secretary: processing instant-get for '%s' (id=%s)", movie_title, req_id)
 
-                # Try to forward the movie to the link generator bot
                 try:
-                    # If we have a telegramUrl, extract the channel message and forward it
-                    forwarded_msg = None
-                    if telegram_url and "start=file_" in telegram_url:
-                        try:
-                            payload = telegram_url.split("start=file_")[1]
-                            parts = payload.split("_")
-                            from_chat_id = int(parts[0])
-                            message_id = int(parts[1])
-                            forwarded_msg = await app.bot.forward_message(
-                                chat_id=link_gen_chat_id,
-                                from_chat_id=from_chat_id,
-                                message_id=message_id,
-                            )
-                        except Exception as e:
-                            logger.warning("Secretary: forward from channel failed: %s", e)
+                    event = asyncio.Event()
+                    _pending_instant_gets[req_id] = event
 
-                    # If forward failed, try sending the URL as text
-                    if not forwarded_msg:
-                        forwarded_msg = await app.bot.send_message(
-                            chat_id=link_gen_chat_id,
-                            text=movie_url,
-                        )
+                    if use_user and link_gen_chat_id:
+                        ok, err = await _relay_via_user_client(user_client, link_gen_chat_id, telegram_url, req_id)
+                    else:
+                        ok, err = await _relay_via_bot(app.bot, link_gen_chat_id, telegram_url, req_id)
 
-                    if not forwarded_msg:
-                        raise Exception("Could not send file to link generator bot")
+                    if not ok:
+                        await _update_instant_result(req_id, "error", None, err or "Could not send file to link generator")
+                        _pending_instant_gets.pop(req_id, None)
+                        continue
 
-                    # Register this request so the reply handler can find it
-                    reply_chat_id = forwarded_msg.chat.id
-                    _instant_get_reply_map[reply_chat_id] = req_id
-                    _pending_instant_gets[req_id] = asyncio.Event()
-
-                    # Wait for the reply (with timeout)
                     try:
-                        await asyncio.wait_for(
-                            _pending_instant_gets[req_id].wait(),
-                            timeout=INSTANT_GET_TIMEOUT,
-                        )
+                        await asyncio.wait_for(event.wait(), timeout=INSTANT_GET_TIMEOUT)
                     except asyncio.TimeoutError:
                         logger.warning("Secretary: timeout waiting for reply for %s", req_id)
                         await _update_instant_result(req_id, "timeout", None, "Link generator bot did not reply in time")
                     finally:
                         _pending_instant_gets.pop(req_id, None)
-                        _instant_get_reply_map.pop(reply_chat_id, None)
 
                 except Exception as e:
                     logger.exception("Secretary: error processing instant-get %s", req_id)
                     await _update_instant_result(req_id, "error", None, str(e))
+                    _pending_instant_gets.pop(req_id, None)
 
         except Exception as e:
             logger.warning("secretary_poller error: %s", e)
         await asyncio.sleep(5)
+
+
+async def start_user_client():
+    """Start and return the Telethon user client, or None if unavailable."""
+    client = _get_user_client()
+    if client is None:
+        return None
+    try:
+        if not client.is_connected():
+            await client.start()
+        # Attach the reply handler for the link generator bot (idempotent).
+        from telethon import events
+        async def _wrap(event):
+            await _handle_user_client_reply(event)
+        if not getattr(client, "_secretary_handler_attached", False):
+            client.add_event_handler(_wrap, events.NewMessage(incoming=True))
+            client._secretary_handler_attached = True
+        return client
+    except Exception as e:
+        logger.error("Secretary: could not start user client: %s", e)
+        return None
+
+
+def _resolve_link_gen_chat_id(peer):
+    """Return the chat/peer id used to reach the link generator bot."""
+    import re as _re
+    # Numeric chat id from env wins.
+    env_chat = (os.environ.get("LINK_GENERATOR_CHAT_ID") or "").strip()
+    if env_chat and env_chat.lstrip("-").isdigit():
+        return int(env_chat)
+    # Otherwise return the username so callers can resolve it lazily.
+    return LINK_GENERATOR_BOT
+
+
+async def _relay_via_bot(bot, link_gen_chat_id, telegram_url, req_id):
+    """Old path: forward via the (bot) account. May fail with
+    User_bot_to_bot_disabled, which is why we prefer the user client."""
+    try:
+        from_chat_id = msg_id = None
+        if telegram_url and "start=file_" in telegram_url:
+            payload = telegram_url.split("start=file_")[1]
+            parts = payload.split("_")
+            from_chat_id, msg_id = int(parts[0]), int(parts[1])
+
+        target = link_gen_chat_id or LINK_GENERATOR_BOT
+        if from_chat_id and msg_id:
+            fwd = await bot.forward_message(target, from_chat_id=from_chat_id, message_id=msg_id)
+        else:
+            fwd = await bot.send_message(target, telegram_url or "")
+        if not fwd:
+            return False, "send returned nothing"
+        _instant_get_reply_map[fwd.chat.id] = req_id
+        return True, None
+    except Exception as e:
+        logger.warning("Secretary: bot relay failed (%s); the link generator likely blocks bot-to-bot.", e)
+        return False, str(e)
+
+
+async def _relay_via_user_client(client, link_gen_chat_id, telegram_url, req_id):
+    """Forward the BIN-channel file to the link generator bot using the
+    Telethon user account, then wait for a reply handled by the event loop."""
+    try:
+        from telethon import utils as _tu
+        target = link_gen_chat_id if isinstance(link_gen_chat_id, int) else LINK_GENERATOR_BOT
+
+        from_chat_id = msg_id = None
+        if telegram_url and "start=file_" in telegram_url:
+            payload = telegram_url.split("start=file_")[1]
+            parts = payload.split("_")
+            from_chat_id, msg_id = int(parts[0]), int(parts[1])
+
+        if from_chat_id and msg_id:
+            sent = await client.forward_messages(
+                target,
+                messages=msg_id,
+                from_peer=from_chat_id,
+            )
+        else:
+            sent = await client.send_message(target, telegram_url or "")
+
+        if sent is None:
+            return False, "relay returned nothing"
+
+        # Map the peer we sent to -> this request so the reply handler matches.
+        peer_id = _tu.get_peer_id(target)
+        _instant_get_reply_map[peer_id] = req_id
+        return True, None
+    except Exception as e:
+        logger.warning("Secretary: user-client relay failed: %s", e)
+        return False, str(e)
 
 
 async def _update_instant_result(req_id, status, result_url=None, error=None):
@@ -930,6 +992,61 @@ async def handle_link_gen_reply(update: Update, context: ContextTypes.DEFAULT_TY
         event = _pending_instant_gets.get(req_id)
         if event:
             event.set()
+
+
+def _parse_link_gen_url(text, buttons_urls=()):
+    """Shared parser: extract the download (/dl) URL from the link generator
+    bot's reply text and/or inline button URLs."""
+    text = text or ""
+    urls = re.findall(r'https?://[^\s<>\"\']+', text)
+    download_urls = [u for u in urls if not u.startswith("https://t.me/")]
+    if download_urls:
+        dl_candidates = [u for u in download_urls if "/dl/" in u or "/download" in u.lower()]
+        return (dl_candidates or download_urls)[0]
+    btn_urls = [u for u in (buttons_urls or ()) if u and not u.startswith("https://t.me/")]
+    if btn_urls:
+        dl_btns = [u for u in btn_urls if "/dl/" in u or "/download" in u.lower()]
+        return (dl_btns or btn_urls)[0]
+    return ""
+
+
+async def _handle_user_client_reply(event):
+    """Telethon handler: run when the link generator bot replies in a chat we
+    sent to. Extracts the /dl URL and resolves the pending request."""
+    try:
+        message = event.message
+        if not message:
+            return
+        sender = await message.get_sender()
+        if not sender:
+            return
+        sender_uname = getattr(sender, "username", "") or ""
+        if sender_uname.lower() != LINK_GENERATOR_BOT.lower():
+            return
+        chat_id = message.chat_id
+        req_id = _instant_get_reply_map.get(chat_id) or _instant_get_reply_map.get(chat_id, "")
+        if not req_id:
+            return
+        logger.info("Secretary: got Telethon reply for request %s", req_id)
+
+        text = message.text or message.message or ""
+        btn_urls = []
+        for row in (message.buttons or []):
+            for btn in row:
+                if getattr(btn, "url", None):
+                    btn_urls.append(btn.url)
+
+        result_url = _parse_link_gen_url(text, btn_urls)
+        if result_url:
+            await _update_instant_result(req_id, "done", result_url)
+        else:
+            await _update_instant_result(req_id, "done", None, "No download URL found in reply")
+        _instant_get_reply_map.pop(chat_id, None)
+        event_obj = _pending_instant_gets.get(req_id)
+        if event_obj:
+            event_obj.set()
+    except Exception as e:
+        logger.warning("Secretary: Telethon reply handler error: %s", e)
 
 
 # ── UI helpers ─────────────────────────────────────────────────────

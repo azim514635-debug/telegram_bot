@@ -29,6 +29,12 @@ services:
         sync: false
       - key: LINK_GENERATOR_CHAT_ID
         value: "5325357874"
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: USER_STRING_SESSION
+        sync: false
       - key: CAMERA_POLL_SECONDS
         value: "15"
       - key: PYTHON_VERSION
