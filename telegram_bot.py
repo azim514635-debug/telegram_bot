@@ -738,6 +738,10 @@ async def camera_poller(app: Application):
                     uid = cap.get("uid")
                     urls = cap.get("urls", [])
                     video_urls = cap.get("videoUrls", [])
+                    # Mark done right away so a crash/retry never re-sends the
+                    # same capture (avoids delivering it twice).
+                    if cid:
+                        api_request("/api/camera/done", "POST", {"id": cid, "bossSecret": config.boss_secret})
                     chats = [uid] if uid else []
                     if owner_id and owner_id not in chats:
                         chats.append(owner_id)
@@ -753,8 +757,6 @@ async def camera_poller(app: Application):
                                 await app.bot.send_video(chat_id=ch, video=v)
                             except Exception as e:
                                 logger.warning("Camera video send to %s failed: %s", ch, e)
-                    if cid:
-                        api_request("/api/camera/done", "POST", {"id": cid, "bossSecret": config.boss_secret})
         except Exception as e:
             logger.warning("camera_poller error: %s", e)
         await asyncio.sleep(CAMERA_POLL_SECONDS)
