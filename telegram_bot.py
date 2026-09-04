@@ -1786,44 +1786,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ── Link expiry checker (background loop) ──────────────────────────
-async def _link_expiry_checker(app: Application):
-    """Every 2 hours, check for movies/links whose resolved link has expired
-    and regenerate them by creating fresh instant-get requests."""
-    await asyncio.sleep(30)  # let secretary_poller start first
-    while True:
-        await asyncio.sleep(2 * 60 * 60)  # 2 hours
-        try:
-            if not config.boss_secret:
-                continue
-            status, body = api_request(
-                "/api/instant-get-expired", "GET", boss_secret=config.boss_secret
-            )
-            if status != 200 or not isinstance(body, dict):
-                continue
-            items = body.get("movies", [])
-            if not items:
-                continue
-            logger.info("Link expiry checker: regenerating %d expired links.", len(items))
-            for m in items:
-                movie_id = m.get("id")
-                title = m.get("title", "Unknown")
-                tg_url = m.get("telegramUrl", "")
-                if not movie_id or not tg_url:
-                    continue
-                try:
-                    api_request(
-                        "/api/instant-get",
-                        "POST",
-                        {"movieId": movie_id},
-                        boss_secret=config.boss_secret,
-                    )
-                    logger.info("Link expiry checker: triggered re-generation for '%s'.", title)
-                except Exception as e:
-                    logger.warning("Link expiry checker: failed for '%s': %s", title, e)
-        except Exception as e:
-            logger.warning("Link expiry checker error: %s", e)
-
 
 # ── Set bot commands menu ──────────────────────────────────────────
 async def post_init(app: Application):
@@ -1848,8 +1810,6 @@ async def post_init(app: Application):
     logger.info("Camera delivery loop started.")
     asyncio.create_task(secretary_poller(app))
     logger.info("Secretary Mode loop started.")
-    asyncio.create_task(_link_expiry_checker(app))
-    logger.info("Link expiry checker loop started (every 2h).")
 
     # Keep-alive to prevent Render free-tier spin-down after ~15 min of
     # inactivity. Runs inside the event loop (post_init) so create_task is safe.
