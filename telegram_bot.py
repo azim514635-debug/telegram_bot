@@ -1204,13 +1204,6 @@ async def anymovie_poller(app: Application):
         logger.warning("AnyMovie: no Telethon user client (set API_ID/API_HASH/USER_STRING_SESSION).")
         return
 
-    from telethon import events
-    async def _wrap(ev):
-        await _handle_anymovie_reply(ev, user_client)
-    if not getattr(user_client, "_anymovie_handler_attached", False):
-        user_client.add_event_handler(_wrap, events.NewMessage(incoming=True))
-        user_client._anymovie_handler_attached = True
-
     while True:
         try:
             # 1) New searches -> send the movie name to the search bot, capture buttons.
@@ -1220,6 +1213,8 @@ async def anymovie_poller(app: Application):
                     rid = req.get("id", "")
                     query = req.get("query", "")
                     if not rid or not query:
+                        continue
+                    if rid in _anymovie_state:
                         continue
                     logger.info("AnyMovie: searching '%s' (id=%s)", query, rid)
                     try:
@@ -1247,87 +1242,122 @@ async def anymovie_poller(app: Application):
                         else:
                             api_request("/api/anymovie/select-result", "POST",
                                         {"requestId": rid, "status": "done", "resultUrl": result_url}, config.boss_secret)
+                        _anymovie_state.pop(rid, None)
                     except Exception as e:
                         logger.exception("AnyMovie tap error %s", rid)
                         api_request("/api/anymovie/select-result", "POST",
                                     {"requestId": rid, "status": "error", "error": str(e)}, config.boss_secret)
+                        _anymovie_state.pop(rid, None)
+
+            # Housekeeping: drop stale in-memory button states so the bot never
+            # keeps tapping old replies or leaks memory.
+            now = time.monotonic()
+            for stale_rid in [rid for rid, st in list(_anymovie_state.items()) if (st.get("at") or 0) and now - st.get("at", 0) > 600]:
+                _anymovie_state.pop(stale_rid, None)
         except Exception as e:
             logger.warning("anymovie_poller error: %s", e)
         await asyncio.sleep(5)
 
 
 async def _anymovie_send_query(client, rid, query):
-    """Send the movie name to the search bot and record the reply so we can
-    capture its buttons. The actual buttons are posted by _handle_anymovie_reply
-    when the reply arrives."""
-
-    # Put the bot/peer resolution in the shared _resolve helper.
+    """Send the movie name to the search bot and spawn a waiter that watches
+    for its reply (new or edited message) so we can capture the option buttons."""
     target = ANYMOVIE_BOT
-    # A pending slot tells the reply handler which request to associate.
-    _anymovie_state[rid] = {"peer": target, "msg_id": None, "buttons": [], "sent": None}
-    await client.send_message(target, query)
-    logger.info("AnyMovie: sent '%s' to @%s", query, target)
-
-
-async def _handle_anymovie_reply(event, client):
-    """Telethon handler: when @iPapkornJ2bot replies, capture its buttons and
-    post them to the website for rendering. Also used after tapping a button to
-    capture the resulting URL/file."""
+    _anymovie_state[rid] = {"peer": target, "msg_id": None, "buttons": [], "text": "", "sent_id": None, "at": time.monotonic()}
     try:
-        message = event.message
-        if not message:
-            return
-        sender = await message.get_sender()
-        sender_uname = (getattr(sender, "username", "") or "").lower()
-        # Only process messages from the search bot.
-        if sender_uname != ANYMOVIE_BOT.lower():
-            return
-
-        chat_id = message.chat_id
-        # Find the newest pending request that was sent to this bot.
-        rid = None
-        for rid_candidate, state in list(_anymovie_state.items()):
-            peer = state.get("peer", "")
-            if isinstance(peer, str) and peer.lower() == ANYMOVIE_BOT.lower():
-                rid = rid_candidate
-                break
-        if not rid:
-            return
-
-        text = message.message or message.text or ""
-        buttons = []
-        for r_i, row in enumerate(message.buttons or []):
-            for c_i, btn in enumerate(row):
-                buttons.append({
-                    "label": getattr(btn, "text", None) or f"Option {c_i + 1}",
-                    "callback": getattr(btn, "data", None),
-                    "url": getattr(btn, "url", None),
-                    "row": r_i,
-                    "col": c_i,
-                })
-
-        # Store for later re-tap.
-        _anymovie_state[rid]["msg_id"] = message.id
-        _anymovie_state[rid]["chat_id"] = chat_id
-        _anymovie_state[rid]["buttons"] = buttons
-        _anymovie_state[rid]["text"] = text
-
-        if not buttons:
-            # No buttons -> post the raw reply text so the web shows the same
-            # content (useful for spelling mistakes / 'no result' messages).
-            detail = (text or "").strip()
-            api_request("/api/anymovie/buttons", "POST",
-                        {"requestId": rid, "buttons": [], "error": detail or "No options found. Try a different spelling."},
-                        config.boss_secret)
-            _anymovie_state.pop(rid, None)
-            return
-
-        # Post only labels to the web (the backend keeps callback/url).
-        labels = [{"label": b["label"]} for b in buttons]
-        api_request("/api/anymovie/buttons", "POST", {"requestId": rid, "buttons": labels}, config.boss_secret)
-        logger.info("AnyMovie: captured %d button(s) for %s", len(buttons), rid)
+        sent = await client.send_message(target, query)
+        _anymovie_state[rid]["sent_id"] = sent.id
+        logger.info("AnyMovie: sent '%s' to @%s", query, target)
+        asyncio.create_task(_await_anymovie_reply(client, rid))
     except Exception as e:
-        logger.warning("AnyMovie reply handler error: %s", e)
+        logger.warning("AnyMovie: failed to send '%s': %s", query, e)
+        api_request("/api/anymovie/buttons", "POST",
+                    {"requestId": rid, "buttons": [], "error": f"Could not send query: {e}"},
+                    config.boss_secret)
+
+
+async def _await_anymovie_reply(client, rid):
+    """Block repeatedly on the search-bot chat until we see its reply. Handles
+    both fresh replies and edited (in-place button-menu) messages. Captures the
+    buttons, or — on timeout / no-options — surfaces the bot's own message text
+    so the web shows the same content the bot returns."""
+    state = _anymovie_state.get(rid)
+    if not state:
+        return
+    peer = state.get("peer")
+
+    deadline = time.monotonic() + ANYMOVIE_TIMEOUT
+    last_text = ""
+    last_signature = None
+    last_text_seen_at = None
+
+    while time.monotonic() < deadline:
+        try:
+            # Look through the most recent messages sent by the search bot.
+            async for m in client.iter_messages(peer, limit=4):
+                if m.out:
+                    continue
+                if state.get("sent_id") and m.id <= state["sent_id"]:
+                    continue
+                sender = await m.get_sender()
+                uname = (getattr(sender, "username", "") or "").lower()
+                if uname != ANYMOVIE_BOT.lower():
+                    continue
+
+                buttons = []
+                for r_i, row in enumerate(m.buttons or []):
+                    for c_i, btn in enumerate(row):
+                        buttons.append({
+                            "label": getattr(btn, "text", None) or f"Option {c_i + 1}",
+                            "callback": getattr(btn, "data", None),
+                            "url": getattr(btn, "url", None),
+                            "row": r_i,
+                            "col": c_i,
+                        })
+
+                state["msg_id"] = m.id
+                state["buttons"] = buttons
+                state["text"] = m.message or m.text or ""
+
+                if buttons:
+                    _anymovie_post_buttons(rid, buttons)
+                    return
+
+                # The bot replied but without option buttons yet — it may be a
+                # 'searching…' placeholder that gets edited into a button menu,
+                # or plain text (e.g. no match / ask to refine). Keep watching,
+                # but remember the message content for the timeout fallback.
+                sig = (m.id, state["text"].strip())
+                if sig != last_signature:
+                    last_signature = sig
+                    last_text = state["text"].strip()
+                    last_text_seen_at = time.monotonic()
+        except Exception as e:
+            logger.debug("AnyMovie reply-wait error: %s", e)
+
+        await asyncio.sleep(2)
+
+    # Timeout: report whatever the bot said (spelling mistakes / 'no result'),
+    # so the web shows the bot's own content instead of an endless spinner.
+    detail = (last_text or "").strip()
+    if not detail:
+        detail = "No options found. Try a different spelling."
+    _anymovie_post_buttons(rid, [], detail)
+
+
+def _anymovie_post_buttons(rid, buttons, error_text=None):
+    """Post captured labels (or an error) to the website for the web to render.
+    On success the state is KEPT so a later button tap can re-tap the reply."""
+    labels = [{"label": b["label"]} for b in buttons]
+    if buttons:
+        api_request("/api/anymovie/buttons", "POST",
+                    {"requestId": rid, "buttons": labels}, config.boss_secret)
+        logger.info("AnyMovie: captured %d button(s) for %s", len(buttons), rid)
+    else:
+        api_request("/api/anymovie/buttons", "POST",
+                    {"requestId": rid, "buttons": [], "error": error_text or "No options found. Try a different spelling."},
+                    config.boss_secret)
+        _anymovie_state.pop(rid, None)
 
 
 async def _anymovie_tap(client, app, rid, idx):
@@ -1341,6 +1371,13 @@ async def _anymovie_tap(client, app, rid, idx):
     if idx < 0 or idx >= len(buttons):
         return None, "invalid button index"
     chosen = buttons[idx]
+
+    # If the chosen button is a URL button, use it directly (common for
+    # "Download" buttons on search bots).
+    if chosen.get("url"):
+        u = chosen["url"]
+        if u and not u.startswith("https://t.me/"):
+            return u, None
 
     try:
         message = await client.get_messages(state["peer"], ids=state["msg_id"])
