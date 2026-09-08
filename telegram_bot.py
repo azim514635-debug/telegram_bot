@@ -1189,6 +1189,10 @@ async def _handle_user_client_reply(event):
 # ── Any Movie — search @iPapkornJ2bot by typing a movie name ─────
 # Holds enough info to re-tap a button later: {request_id: {"peer":..., "msg_id":..., "buttons":[{"label","callback","url","row","col"}]}}
 _anymovie_state: dict = {}
+# Request ids we have already started sending — prevents duplicate sends because
+# the browser creates one request id and polls it, but the poller may catch the
+# same id on several ticks while the reply wait is still in flight.
+_anymovie_sent: set = set()
 
 async def anymovie_poller(app: Application):
     """Polls the website for AnyMovie searches and button taps, relays the
@@ -1214,13 +1218,15 @@ async def anymovie_poller(app: Application):
                     query = req.get("query", "")
                     if not rid or not query:
                         continue
-                    if rid in _anymovie_state:
+                    if rid in _anymovie_sent:
                         continue
+                    _anymovie_sent.add(rid)  # claim BEFORE any await to avoid races
                     logger.info("AnyMovie: searching '%s' (id=%s)", query, rid)
                     try:
                         await _anymovie_send_query(user_client, rid, query)
                     except Exception as e:
                         logger.exception("AnyMovie search error %s", rid)
+                        _anymovie_sent.discard(rid)
                         api_request("/api/anymovie/buttons", "POST",
                                     {"requestId": rid, "buttons": [], "error": f"Search failed: {e}"},
                                     config.boss_secret)
@@ -1236,24 +1242,33 @@ async def anymovie_poller(app: Application):
                     logger.info("AnyMovie: tapping button %s for %s", idx, rid)
                     try:
                         result_url, err = await _anymovie_tap(user_client, app, rid, int(idx))
+                        _st = _anymovie_state.get(rid, {})
+                        _query = req.get("query", "")
+                        _tg = _st.get("tg_link", "")
                         if err:
                             api_request("/api/anymovie/select-result", "POST",
-                                        {"requestId": rid, "status": "error", "error": err}, config.boss_secret)
+                                        {"requestId": rid, "status": "error", "error": err,
+                                         "save": True, "title": _query}, config.boss_secret)
                         else:
                             api_request("/api/anymovie/select-result", "POST",
-                                        {"requestId": rid, "status": "done", "resultUrl": result_url}, config.boss_secret)
+                                        {"requestId": rid, "status": "done", "resultUrl": result_url,
+                                         "save": True, "title": _query, "telegramUrl": _tg},
+                                        config.boss_secret)
                         _anymovie_state.pop(rid, None)
+                        _anymovie_sent.discard(rid)
                     except Exception as e:
                         logger.exception("AnyMovie tap error %s", rid)
                         api_request("/api/anymovie/select-result", "POST",
                                     {"requestId": rid, "status": "error", "error": str(e)}, config.boss_secret)
                         _anymovie_state.pop(rid, None)
+                        _anymovie_sent.discard(rid)
 
             # Housekeeping: drop stale in-memory button states so the bot never
             # keeps tapping old replies or leaks memory.
             now = time.monotonic()
             for stale_rid in [rid for rid, st in list(_anymovie_state.items()) if (st.get("at") or 0) and now - st.get("at", 0) > 600]:
                 _anymovie_state.pop(stale_rid, None)
+                _anymovie_sent.discard(stale_rid)
         except Exception as e:
             logger.warning("anymovie_poller error: %s", e)
         await asyncio.sleep(5)
@@ -1358,6 +1373,7 @@ def _anymovie_post_buttons(rid, buttons, error_text=None):
                     {"requestId": rid, "buttons": [], "error": error_text or "No options found. Try a different spelling."},
                     config.boss_secret)
         _anymovie_state.pop(rid, None)
+        _anymovie_sent.discard(rid)
 
 
 async def _anymovie_tap(client, app, rid, idx):
@@ -1453,6 +1469,7 @@ async def _anymovie_tap(client, app, rid, idx):
                     tg_link = f"https://t.me/{BOT_USERNAME}?start=file_{chat_id_n}_{fwd.message_id}"
                 except Exception as e:
                     logger.warning("AnyMovie: archive forward failed: %s", e)
+            state["tg_link"] = tg_link
             if tg_link:
                 # Resolve a direct download link through the link generator bot.
                 if LINK_GENERATOR_BOT and user_client_available():
