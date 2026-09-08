@@ -1378,6 +1378,8 @@ async def _await_anymovie_reply(client, rid):
     last_text = ""
     last_signature = None
     last_text_seen_at = None
+    seen_bot_msgs = 0
+    seen_with_buttons = 0
 
     while time.monotonic() < deadline:
         try:
@@ -1390,6 +1392,7 @@ async def _await_anymovie_reply(client, rid):
                 if uname != ANYMOVIE_BOT.lower():
                     continue
 
+                seen_bot_msgs += 1
                 buttons = _anymovie_extract_buttons(m)
 
                 state["msg_id"] = m.id
@@ -1397,6 +1400,7 @@ async def _await_anymovie_reply(client, rid):
                 state["text"] = m.message or m.text or ""
 
                 if buttons:
+                    seen_with_buttons += 1
                     _anymovie_post_buttons(rid, buttons)
                     return
 
@@ -1419,6 +1423,7 @@ async def _await_anymovie_reply(client, rid):
     detail = (last_text or "").strip()
     if not detail:
         detail = "No options found. Try a different spelling."
+    detail += f" [bot msgs: {seen_bot_msgs}, with buttons: {seen_with_buttons}]"
     _anymovie_post_buttons(rid, [], detail)
 
 
