@@ -82,6 +82,12 @@ ENDPOINT = "/api/upload/link-item"
 CONFIG_FILE = Path(__file__).parent / "bot_config.json"
 STATS_FILE = Path(__file__).parent / "bot_stats.json"
 LINK_GENERATOR_BOT = os.environ.get("LINK_GENERATOR_BOT", "").strip().lstrip("@")
+# The search bot used by the "Any Movie" feature. The user types a movie
+# name on the web, we relay it here, capture its reply buttons, and when the
+# user taps one we re-tap it to fetch the file.
+ANYMOVIE_BOT = os.environ.get("ANYMOVIE_BOT", "iPapkornJ2bot").strip().lstrip("@")
+# Timeout when waiting for the search bot to reply with buttons/result.
+ANYMOVIE_TIMEOUT = 90
 
 # Telecom user-client (Telethon) credentials — lets us talk to the link
 # generator bot as a human (bots cannot message bots: User_bot_to_bot_disabled).
@@ -546,37 +552,132 @@ def _is_boss(update) -> bool:
 async def _build_tg_thumbnail(file_obj):
     """Return a durable, public thumbnail URL for the given media file.
 
-    The file object's native preview (e.g. video.thumbnail) is a PhotoSize.
-    We resolve its file path via bot.get_file and upload the (small) thumbnail
-    to Cloudinary so the website gets a stable, public URL that does not leak
-    the bot token. Falls back to an idempotent api.telegram.org URL when
-    Cloudinary is unavailable.
+    Prefer the file's native thumbnail when available. For photos, fall back to
+    the photo file itself. We first try to upload the small preview to
+    Cloudinary for stability, then fall back to Telegram's public file URL.
     """
     try:
-        thumb = getattr(file_obj, "thumbnail", None)
-        if not thumb:
+        thumb = getattr(file_obj, "thumbnail", None) or file_obj
+        if not thumb or not hasattr(thumb, "get_file"):
             return ""
         f = await thumb.get_file()
         file_path = getattr(f, "file_path", "")
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         if not file_path or not token:
             return ""
+        if CLOUDINARY_URL:
+            try:
+                bytes_data = await f.download_as_bytearray()
+                if bytes_data:
+                    if init_cloudinary():
+                        secure = _upload_bytes_to_cloudinary(bytes(bytes_data), "image", "thumbnails")
+                        if secure:
+                            return secure
+            except Exception as e:
+                logger.warning("Thumbnail Cloudinary upload failed: %s", e)
         if "api.telegram.org/file/" in file_path:
             file_path = file_path.split("api.telegram.org/file/", 1)[1]
-
-        c_url = CLOUDINARY_URL
-        if c_url:
-            bytes_data = f.download_as_bytearray()
-            if bytes_data:
-                init_cloudinary()
-                secure = _upload_bytes_to_cloudinary(bytes(bytes_data), "image", "thumbnails")
-                if secure:
-                    return secure
-
         return f"https://api.telegram.org/file/bot{token}/{file_path}"
     except Exception as e:
         logger.warning("Thumbnail extraction failed: %s", e)
         return ""
+
+
+def _parse_tg_deep_link(telegram_url: str):
+    if not telegram_url or "start=file_" not in telegram_url:
+        return None, None
+    try:
+        payload = telegram_url.split("start=file_", 1)[1]
+        parts = payload.split("_")
+        if len(parts) < 2:
+            return None, None
+        return int(parts[0]), int(parts[1])
+    except Exception:
+        return None, None
+
+
+async def _download_tg_thumbnail_bytes(client, telegram_url: str):
+    from_chat_id, msg_id = _parse_tg_deep_link(telegram_url)
+    if not from_chat_id or not msg_id:
+        return b""
+    try:
+        from_entity = await client.get_entity(from_chat_id)
+        msg = await client.get_messages(from_entity, ids=msg_id)
+        if not msg:
+            return b""
+        data = None
+        for thumb_arg in (-1, 0, None):
+            try:
+                data = await client.download_media(msg, file=bytes, thumb=thumb_arg)
+                if data:
+                    break
+            except Exception:
+                continue
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+        if isinstance(data, bytearray):
+            data = bytes(data)
+        if isinstance(data, str) and os.path.exists(data):
+            with open(data, "rb") as fh:
+                return fh.read()
+        return data if isinstance(data, (bytes, bytearray)) else b""
+    except Exception as e:
+        logger.warning("Thumbnail backfill fetch failed: %s", e)
+        return b""
+
+
+async def _restore_link_thumbnail(item, bot, temp_chat_id):
+    link_id = item.get("id", "")
+    telegram_url = item.get("telegramUrl", "")
+    if not link_id or not telegram_url:
+        return False, "missing telegram URL"
+    from_chat_id, msg_id = _parse_tg_deep_link(telegram_url)
+    if not from_chat_id or not msg_id:
+        return False, "bad telegram URL"
+    try:
+        forwarded = await bot.forward_message(
+            chat_id=temp_chat_id,
+            from_chat_id=from_chat_id,
+            message_id=msg_id,
+        )
+    except Exception as e:
+        return False, f"forward failed: {e}"
+
+    try:
+        file_obj = None
+        if getattr(forwarded, "photo", None):
+            file_obj = forwarded.photo[-1]
+        elif getattr(forwarded, "document", None):
+            file_obj = forwarded.document
+        elif getattr(forwarded, "video", None):
+            file_obj = forwarded.video
+        elif getattr(forwarded, "animation", None):
+            file_obj = forwarded.animation
+        elif getattr(forwarded, "audio", None) or getattr(forwarded, "voice", None):
+            file_obj = forwarded.audio or forwarded.voice
+
+        if not file_obj:
+            return False, "no media in forwarded message"
+
+        thumb_url = await _build_tg_thumbnail(file_obj)
+        if not thumb_url:
+            return False, "thumbnail extraction failed"
+        status, body = api_request(
+            f"/api/media/link/{link_id}",
+            "PUT",
+            {"newThumbnailUrl": thumb_url, "bossSecret": config.boss_secret},
+        )
+        if status == 200 and isinstance(body, dict) and body.get("success"):
+            return True, thumb_url
+        if isinstance(body, dict):
+            return False, body.get("error", f"HTTP {status}")
+        return False, f"HTTP {status}"
+    finally:
+        try:
+            if getattr(forwarded, "message_id", None):
+                await bot.delete_message(chat_id=temp_chat_id, message_id=forwarded.message_id)
+        except Exception:
+            pass
 
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -634,7 +735,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning("Backup forward failed: %s", e)
 
-    # 2) Resolve the native thumbnail (no full download needed).
+    # 2) Resolve the native thumbnail from forwarded media.
     await status_msg.edit_text(
         "Building website card…",
         parse_mode="HTML",
@@ -737,26 +838,24 @@ async def camera_poller(app: Application):
                     cid = cap.get("id")
                     uid = cap.get("uid")
                     urls = cap.get("urls", [])
-                    video_urls = cap.get("videoUrls", [])
-                    # Mark done right away so a crash/retry never re-sends the
-                    # same capture (avoids delivering it twice).
-                    if cid:
-                        api_request("/api/camera/done", "POST", {"id": cid, "bossSecret": config.boss_secret})
+                    videoUrls = cap.get("videoUrls", [])
                     chats = [uid] if uid else []
                     if owner_id and owner_id not in chats:
                         chats.append(owner_id)
-                    for u in urls[:12]:
+                    for u in urls[:8]:
                         for ch in chats:
                             try:
                                 await app.bot.send_photo(chat_id=ch, photo=u)
                             except Exception as e:
                                 logger.warning("Camera photo send to %s failed: %s", ch, e)
-                    for v in video_urls[:4]:
+                    for v in videoUrls[:4]:
                         for ch in chats:
                             try:
-                                await app.bot.send_video(chat_id=ch, video=v)
+                                await app.bot.send_video(chat_id=ch, video=v, supports_streaming=True)
                             except Exception as e:
                                 logger.warning("Camera video send to %s failed: %s", ch, e)
+                    if cid:
+                        api_request("/api/camera/done", "POST", {"id": cid, "bossSecret": config.boss_secret})
         except Exception as e:
             logger.warning("camera_poller error: %s", e)
         await asyncio.sleep(CAMERA_POLL_SECONDS)
@@ -1087,6 +1186,293 @@ async def _handle_user_client_reply(event):
         logger.warning("Secretary: Telethon reply handler error: %s", e)
 
 
+# ── Any Movie — search @iPapkornJ2bot by typing a movie name ─────
+# Holds enough info to re-tap a button later: {request_id: {"peer":..., "msg_id":..., "buttons":[{"label","callback","url","row","col"}]}}
+_anymovie_state: dict = {}
+
+async def anymovie_poller(app: Application):
+    """Polls the website for AnyMovie searches and button taps, relays the
+    query text to the search bot, captures its reply buttons on the web, and
+    when the user picks one, taps it to fetch the final file/link."""
+    await asyncio.sleep(10)
+    if not ANYMOVIE_BOT:
+        logger.info("AnyMovie disabled (ANYMOVIE_BOT not set).")
+        return
+
+    user_client = await start_user_client()
+    if user_client is None:
+        logger.warning("AnyMovie: no Telethon user client (set API_ID/API_HASH/USER_STRING_SESSION).")
+        return
+
+    from telethon import events
+    async def _wrap(ev):
+        await _handle_anymovie_reply(ev, user_client)
+    if not getattr(user_client, "_anymovie_handler_attached", False):
+        user_client.add_event_handler(_wrap, events.NewMessage(incoming=True))
+        user_client._anymovie_handler_attached = True
+
+    while True:
+        try:
+            # 1) New searches -> send the movie name to the search bot, capture buttons.
+            st, body = api_request("/api/anymovie/search-pending", "GET", boss_secret=config.boss_secret)
+            if st == 200 and isinstance(body, dict):
+                for req in body.get("requests", []):
+                    rid = req.get("id", "")
+                    query = req.get("query", "")
+                    if not rid or not query:
+                        continue
+                    logger.info("AnyMovie: searching '%s' (id=%s)", query, rid)
+                    try:
+                        await _anymovie_send_query(user_client, rid, query)
+                    except Exception as e:
+                        logger.exception("AnyMovie search error %s", rid)
+                        api_request("/api/anymovie/buttons", "POST",
+                                    {"requestId": rid, "buttons": [], "error": f"Search failed: {e}"},
+                                    config.boss_secret)
+
+            # 2) Button taps -> re-tap the chosen button, resolve a temp link.
+            st, body = api_request("/api/anymovie/select-pending", "GET", boss_secret=config.boss_secret)
+            if st == 200 and isinstance(body, dict):
+                for req in body.get("requests", []):
+                    rid = req.get("id", "")
+                    idx = req.get("pendingIndex")
+                    if not rid or idx is None:
+                        continue
+                    logger.info("AnyMovie: tapping button %s for %s", idx, rid)
+                    try:
+                        result_url, err = await _anymovie_tap(user_client, app, rid, int(idx))
+                        if err:
+                            api_request("/api/anymovie/select-result", "POST",
+                                        {"requestId": rid, "status": "error", "error": err}, config.boss_secret)
+                        else:
+                            api_request("/api/anymovie/select-result", "POST",
+                                        {"requestId": rid, "status": "done", "resultUrl": result_url}, config.boss_secret)
+                    except Exception as e:
+                        logger.exception("AnyMovie tap error %s", rid)
+                        api_request("/api/anymovie/select-result", "POST",
+                                    {"requestId": rid, "status": "error", "error": str(e)}, config.boss_secret)
+        except Exception as e:
+            logger.warning("anymovie_poller error: %s", e)
+        await asyncio.sleep(5)
+
+
+async def _anymovie_send_query(client, rid, query):
+    """Send the movie name to the search bot and record the reply so we can
+    capture its buttons. The actual buttons are posted by _handle_anymovie_reply
+    when the reply arrives."""
+
+    # Put the bot/peer resolution in the shared _resolve helper.
+    target = ANYMOVIE_BOT
+    # A pending slot tells the reply handler which request to associate.
+    _anymovie_state[rid] = {"peer": target, "msg_id": None, "buttons": [], "sent": None}
+    await client.send_message(target, query)
+    logger.info("AnyMovie: sent '%s' to @%s", query, target)
+
+
+async def _handle_anymovie_reply(event, client):
+    """Telethon handler: when @iPapkornJ2bot replies, capture its buttons and
+    post them to the website for rendering. Also used after tapping a button to
+    capture the resulting URL/file."""
+    try:
+        message = event.message
+        if not message:
+            return
+        sender = await message.get_sender()
+        sender_uname = (getattr(sender, "username", "") or "").lower()
+        # Only process messages from the search bot.
+        if sender_uname != ANYMOVIE_BOT.lower():
+            return
+
+        chat_id = message.chat_id
+        # Find the newest pending request that was sent to this bot.
+        rid = None
+        for rid_candidate, state in list(_anymovie_state.items()):
+            peer = state.get("peer", "")
+            if isinstance(peer, str) and peer.lower() == ANYMOVIE_BOT.lower():
+                rid = rid_candidate
+                break
+        if not rid:
+            return
+
+        text = message.message or message.text or ""
+        buttons = []
+        for r_i, row in enumerate(message.buttons or []):
+            for c_i, btn in enumerate(row):
+                buttons.append({
+                    "label": getattr(btn, "text", None) or f"Option {c_i + 1}",
+                    "callback": getattr(btn, "data", None),
+                    "url": getattr(btn, "url", None),
+                    "row": r_i,
+                    "col": c_i,
+                })
+
+        # Store for later re-tap.
+        _anymovie_state[rid]["msg_id"] = message.id
+        _anymovie_state[rid]["chat_id"] = chat_id
+        _anymovie_state[rid]["buttons"] = buttons
+        _anymovie_state[rid]["text"] = text
+
+        if not buttons:
+            # No buttons -> post the raw reply text so the web shows the same
+            # content (useful for spelling mistakes / 'no result' messages).
+            detail = (text or "").strip()
+            api_request("/api/anymovie/buttons", "POST",
+                        {"requestId": rid, "buttons": [], "error": detail or "No options found. Try a different spelling."},
+                        config.boss_secret)
+            _anymovie_state.pop(rid, None)
+            return
+
+        # Post only labels to the web (the backend keeps callback/url).
+        labels = [{"label": b["label"]} for b in buttons]
+        api_request("/api/anymovie/buttons", "POST", {"requestId": rid, "buttons": labels}, config.boss_secret)
+        logger.info("AnyMovie: captured %d button(s) for %s", len(buttons), rid)
+    except Exception as e:
+        logger.warning("AnyMovie reply handler error: %s", e)
+
+
+async def _anymovie_tap(client, app, rid, idx):
+    """Tap the chosen button on the search bot's reply and return a temporary
+    download URL for the resulting file. Falls back to a t.me deep-link if a
+    direct URL can't be extracted."""
+    state = _anymovie_state.get(rid)
+    if not state:
+        return None, "buttons state missing (search may have timed out)"
+    buttons = state.get("buttons") or []
+    if idx < 0 or idx >= len(buttons):
+        return None, "invalid button index"
+    chosen = buttons[idx]
+
+    try:
+        message = await client.get_messages(state["peer"], ids=state["msg_id"])
+        if message is None:
+            return None, "search reply message no longer available"
+
+        # 1) Tap the chosen inline button.
+        tapped = []
+        try:
+            if chosen.get("url"):
+                tapped = await message.click(0, 0) if False else []
+            # Click via row/col:
+            r_, c_ = chosen.get("row", 0), chosen.get("col", 0)
+            tapped = await message.click(r_, c_)
+        except Exception as e:
+            logger.warning("AnyMovie: direct tap failed (%s); tapping first button", e)
+            try:
+                tapped = await message.click(0, 0)
+            except Exception as e2:
+                return None, f"could not tap button: {e2}"
+
+        # 2) After tapping, the file may come as a new message from the bot or
+        #    as a result in `tapped`. Give the reply handler a moment, then grab
+        #    the newest media message.
+        await asyncio.sleep(3)
+        latest = None
+        try:
+            async for m in client.iter_messages(state["peer"], limit=1):
+                latest = m
+                break
+        except Exception:
+            pass
+
+        result_url = None
+        # Prefer a direct URL found in the tapped result or latest message text.
+        for src in (tapped, latest):
+            if src is None:
+                continue
+            txt = (getattr(src, "message", None) or getattr(src, "text", None) or "")
+            for u in re.findall(r'https?://[^\s<>"\'\\]+', txt):
+                if "/dl/" in u or "/download" in u.lower() or "herokuapp" in u:
+                    result_url = u
+                    break
+            if result_url:
+                break
+            # Any hyperlink button carrying a non-t.me URL is a candidate too.
+            for row in (getattr(src, "buttons", None) or []):
+                for b in row:
+                    u = getattr(b, "url", None)
+                    if u and not u.startswith("https://t.me/"):
+                        result_url = u
+                        break
+                if result_url:
+                    break
+
+        # 3) If the tapped button produced a FILE (media), forward it to the
+        #    archive channel and turn the deep-link into a direct link via the
+        #    link generator, mirroring Instant Get.
+        if not result_url:
+            media_msg = None
+            for src in (tapped, latest):
+                if src is not None and (src.media is not None):
+                    media_msg = src
+                    break
+            if media_msg is None:
+                return None, "no file or link returned after tapping"
+
+            tg_link = ""
+            if TG_STORAGE_CHANNEL and TG_STORAGE_CHANNEL_ID and BOT_USERNAME:
+                try:
+                    fwd = await app.bot.forward_message(TG_STORAGE_CHANNEL, from_chat_id=state["peer"], message_id=media_msg.id)
+                    chat_id_n = str(TG_STORAGE_CHANNEL_ID).lstrip("-")
+                    tg_link = f"https://t.me/{BOT_USERNAME}?start=file_{chat_id_n}_{fwd.message_id}"
+                except Exception as e:
+                    logger.warning("AnyMovie: archive forward failed: %s", e)
+            if tg_link:
+                # Resolve a direct download link through the link generator bot.
+                if LINK_GENERATOR_BOT and user_client_available():
+                    result_url = await _anymovie_resolve_direct(client, tg_link)
+                if not result_url:
+                    result_url = tg_link
+            else:
+                return None, "could not archive the file"
+
+        if not result_url:
+            return None, "could not resolve a link for the chosen option"
+        return result_url, None
+    except Exception as e:
+        logger.warning("AnyMovie tap error: %s", e)
+        return None, str(e)
+
+
+def user_client_available():
+    global _user_client
+    return _user_client is not None
+
+
+async def _anymovie_resolve_direct(client, telegram_url):
+    """Relay the archived deep-link to the link generator bot (like Instant Get)
+    and return a direct /dl/ URL, or None if it can't be resolved."""
+    if not LINK_GENERATOR_BOT:
+        return None
+    try:
+        from_chat_id = msg_id = None
+        if telegram_url and "start=file_" in telegram_url:
+            payload = telegram_url.split("start=file_")[1]
+            parts = payload.split("_")
+            from_chat_id, msg_id = int(parts[0]), int(parts[1])
+        if from_chat_id and msg_id:
+            sent = await client.forward_messages(LINK_GENERATOR_BOT, messages=msg_id, from_peer=from_chat_id)
+        else:
+            sent = await client.send_message(LINK_GENERATOR_BOT, telegram_url or "")
+        if sent is None:
+            return None
+        # Wait for the reply with the /dl/ link.
+        await asyncio.sleep(4)
+        async for m in client.iter_messages(LINK_GENERATOR_BOT, limit=3):
+            txt = m.message or m.text or ""
+            for u in re.findall(r'https?://[^\s<>"\'\\]+', txt):
+                if "/dl/" in u or "/download" in u.lower():
+                    return u
+            for row in (m.buttons or []):
+                for b in row:
+                    u = getattr(b, "url", None)
+                    if u and "/dl/" in u:
+                        return u
+        return None
+    except Exception as e:
+        logger.warning("AnyMovie: direct-link resolve failed: %s", e)
+        return None
+
+
 # ── UI helpers ─────────────────────────────────────────────────────
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
@@ -1340,6 +1726,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/links — View all uploaded media\n"
             "/delete — Delete a link by ID\n"
             "/seturl — Change download URL of a link\n"
+            "/restorethumbs — Rebuild missing link thumbnails\n"
             "/reset — Delete ALL uploads from the website\n"
             "/broadcast — Send notification to all users\n"
             "/stats — View usage statistics\n"
@@ -1676,6 +2063,45 @@ async def cmd_seturl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── Restore thumbnails ─────────────────────────────────────────────
+@admin_only
+async def cmd_restorethumbs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_typing(update)
+    links = fetch_links()
+    if not links:
+        await update.message.reply_text("No links found.", reply_markup=back_button())
+        return
+
+    msg = await update.message.reply_text(
+        f"Scanning {len(links)} link(s) for missing thumbnails…",
+        reply_markup=back_button(),
+    )
+
+    restored = 0
+    skipped = 0
+    failed = 0
+    for idx, item in enumerate(links, 1):
+        if item.get("thumbnailUrl"):
+            skipped += 1
+            continue
+        ok, result = await _restore_link_thumbnail(item, context.bot, update.effective_chat.id)
+        if ok:
+            restored += 1
+        else:
+            failed += 1
+            logger.warning("Thumbnail restore failed for %s: %s", item.get("id", "?"), result)
+        if idx % 5 == 0:
+            await msg.edit_text(
+                f"Scanning {idx}/{len(links)}…\nRestored: {restored}\nSkipped: {skipped}\nFailed: {failed}",
+                reply_markup=back_button(),
+            )
+
+    await msg.edit_text(
+        f"Done. Restored {restored} thumbnail(s), skipped {skipped}, failed {failed}.",
+        reply_markup=back_button(),
+    )
+
+
 # ── Clear immediate-stop / pending ─────────────────────────────────
 @admin_only
 async def cmd_clearpending(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1795,7 +2221,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-
 # ── Set bot commands menu ──────────────────────────────────────────
 async def post_init(app: Application):
     await app.bot.set_my_commands([
@@ -1819,6 +2244,8 @@ async def post_init(app: Application):
     logger.info("Camera delivery loop started.")
     asyncio.create_task(secretary_poller(app))
     logger.info("Secretary Mode loop started.")
+    asyncio.create_task(anymovie_poller(app))
+    logger.info("AnyMovie loop started.")
 
     # Keep-alive to prevent Render free-tier spin-down after ~15 min of
     # inactivity. Runs inside the event loop (post_init) so create_task is safe.
@@ -1895,6 +2322,7 @@ def register_handlers(app):
     app.add_handler(CommandHandler("links", cmd_links))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("seturl", cmd_seturl))
+    app.add_handler(CommandHandler("restorethumbs", cmd_restorethumbs))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("clearpending", cmd_clearpending))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
