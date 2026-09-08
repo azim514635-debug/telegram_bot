@@ -1208,6 +1208,19 @@ async def anymovie_poller(app: Application):
         logger.warning("AnyMovie: no Telethon user client (set API_ID/API_HASH/USER_STRING_SESSION).")
         return
 
+    # Event-driven capture: search bots commonly reply by EDITING a message in
+    # place to swap in the button menu, so listen for both new and edited
+    # messages from the search bot.
+    from telethon import events
+    if not getattr(user_client, "_anymovie_events_attached", False):
+        async def _on_new(ev):
+            await _anymovie_on_event(ev)
+        async def _on_edit(ev):
+            await _anymovie_on_event(ev, edited=True)
+        user_client.add_event_handler(_on_new, events.NewMessage(incoming=True))
+        user_client.add_event_handler(_on_edit, events.MessageEdited())
+        user_client._anymovie_events_attached = True
+
     while True:
         try:
             # 1) New searches -> send the movie name to the search bot, capture buttons.
@@ -1283,6 +1296,12 @@ async def _anymovie_send_query(client, rid, query):
     try:
         sent = await client.send_message(target, query)
         _anymovie_state[rid]["sent_id"] = sent.id
+        # Remember the numeric peer so the event handler can attribute replies.
+        try:
+            from telethon import utils as _tu
+            _anymovie_state[rid]["peer_id"] = _tu.get_peer_id(await client.get_entity(target))
+        except Exception:
+            pass
         logger.info("AnyMovie: sent '%s' to @%s", query, target)
         asyncio.create_task(_await_anymovie_reply(client, rid))
     except Exception as e:
@@ -1290,6 +1309,59 @@ async def _anymovie_send_query(client, rid, query):
         api_request("/api/anymovie/buttons", "POST",
                     {"requestId": rid, "buttons": [], "error": f"Could not send query: {e}"},
                     config.boss_secret)
+
+
+async def _anymovie_on_event(event, edited=False):
+    """Telethon handler for NewMessage/MessageEdited from the search bot. Captures
+    the reply's buttons and posts them to the web."""
+    try:
+        message = event.message
+        if not message or not _anymovie_state:
+            return
+        sender = await message.get_sender()
+        uname = (getattr(sender, "username", "") or "").lower()
+        if uname != ANYMOVIE_BOT.lower():
+            return
+
+        # Attribute this message to the newest pending request that already
+        # sent its query to the search bot (has a peer_id).
+        rid = None
+        for rid_candidate, st in reversed(list(_anymovie_state.items())):
+            if st.get("peer_id") is not None:
+                rid = rid_candidate
+                break
+        if not rid:
+            return
+        state = _anymovie_state.get(rid)
+        if not state:
+            return
+        # Do NOT skip by sent_id: the search bot may EDIT an older placeholder
+        # message (id < our sent id) into the button menu, so only our own
+        # outgoing message is excluded (handled by event filters / m.out).
+
+        buttons = _anymovie_extract_buttons(message)
+        state["msg_id"] = message.id
+        state["buttons"] = buttons
+        state["text"] = message.message or message.text or ""
+
+        if buttons:
+            _anymovie_post_buttons(rid, buttons)
+    except Exception as e:
+        logger.debug("AnyMovie event error: %s", e)
+
+
+def _anymovie_extract_buttons(message):
+    buttons = []
+    for r_i, row in enumerate(message.buttons or []):
+        for c_i, btn in enumerate(row):
+            buttons.append({
+                "label": getattr(btn, "text", None) or f"Option {c_i + 1}",
+                "callback": getattr(btn, "data", None),
+                "url": getattr(btn, "url", None),
+                "row": r_i,
+                "col": c_i,
+            })
+    return buttons
 
 
 async def _await_anymovie_reply(client, rid):
@@ -1310,26 +1382,15 @@ async def _await_anymovie_reply(client, rid):
     while time.monotonic() < deadline:
         try:
             # Look through the most recent messages sent by the search bot.
-            async for m in client.iter_messages(peer, limit=4):
+            async for m in client.iter_messages(peer, limit=6):
                 if m.out:
-                    continue
-                if state.get("sent_id") and m.id <= state["sent_id"]:
                     continue
                 sender = await m.get_sender()
                 uname = (getattr(sender, "username", "") or "").lower()
                 if uname != ANYMOVIE_BOT.lower():
                     continue
 
-                buttons = []
-                for r_i, row in enumerate(m.buttons or []):
-                    for c_i, btn in enumerate(row):
-                        buttons.append({
-                            "label": getattr(btn, "text", None) or f"Option {c_i + 1}",
-                            "callback": getattr(btn, "data", None),
-                            "url": getattr(btn, "url", None),
-                            "row": r_i,
-                            "col": c_i,
-                        })
+                buttons = _anymovie_extract_buttons(m)
 
                 state["msg_id"] = m.id
                 state["buttons"] = buttons
@@ -1349,7 +1410,7 @@ async def _await_anymovie_reply(client, rid):
                     last_text = state["text"].strip()
                     last_text_seen_at = time.monotonic()
         except Exception as e:
-            logger.debug("AnyMovie reply-wait error: %s", e)
+            logger.warning("AnyMovie reply-wait error: %s", e)
 
         await asyncio.sleep(2)
 
