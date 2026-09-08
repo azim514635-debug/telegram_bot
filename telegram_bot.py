@@ -1292,7 +1292,7 @@ async def _anymovie_send_query(client, rid, query):
     """Send the movie name to the search bot and spawn a waiter that watches
     for its reply (new or edited message) so we can capture the option buttons."""
     target = ANYMOVIE_BOT
-    _anymovie_state[rid] = {"peer": target, "msg_id": None, "buttons": [], "text": "", "sent_id": None, "at": time.monotonic()}
+    _anymovie_state[rid] = {"peer": target, "msg_id": None, "buttons": [], "text": "", "sent_id": None, "sent_at": time.time(), "at": time.monotonic()}
     try:
         sent = await client.send_message(target, query)
         _anymovie_state[rid]["sent_id"] = sent.id
@@ -1312,8 +1312,9 @@ async def _anymovie_send_query(client, rid, query):
 
 
 async def _anymovie_on_event(event, edited=False):
-    """Telethon handler for NewMessage/MessageEdited from the search bot. Captures
-    the reply's buttons and posts them to the web."""
+    """Fast path: Telethon handler for NewMessage/MessageEdited from the search
+    bot. Captures media files / inline options and posts them, guarded against
+    double-posting with the polling waiter."""
     try:
         message = event.message
         if not message or not _anymovie_state:
@@ -1323,8 +1324,6 @@ async def _anymovie_on_event(event, edited=False):
         if uname != ANYMOVIE_BOT.lower():
             return
 
-        # Attribute this message to the newest pending request that already
-        # sent its query to the search bot (has a peer_id).
         rid = None
         for rid_candidate, st in reversed(list(_anymovie_state.items())):
             if st.get("peer_id") is not None:
@@ -1335,17 +1334,22 @@ async def _anymovie_on_event(event, edited=False):
         state = _anymovie_state.get(rid)
         if not state:
             return
-        # Do NOT skip by sent_id: the search bot may EDIT an older placeholder
-        # message (id < our sent id) into the button menu, so only our own
-        # outgoing message is excluded (handled by event filters / m.out).
+        if state.get("posted"):
+            return
 
-        buttons = _anymovie_extract_buttons(message)
-        state["msg_id"] = message.id
-        state["buttons"] = buttons
-        state["text"] = message.message or message.text or ""
+        media_opts = []
+        if message.media is not None:
+            cap = (message.message or message.text or "").strip()
+            if not cap:
+                cap = f"File 1"
+            media_opts.append({"label": cap, "msg_id": message.id})
+        inline_opts = _anymovie_extract_buttons(message)
 
-        if buttons:
-            _anymovie_post_buttons(rid, buttons)
+        choice = inline_opts or media_opts
+        if choice:
+            state["buttons"] = choice
+            state["mode"] = "button" if inline_opts else "file"
+            _anymovie_post_buttons(rid, choice)
     except Exception as e:
         logger.debug("AnyMovie event error: %s", e)
 
@@ -1365,54 +1369,76 @@ def _anymovie_extract_buttons(message):
 
 
 async def _await_anymovie_reply(client, rid):
-    """Block repeatedly on the search-bot chat until we see its reply. Handles
-    both fresh replies and edited (in-place button-menu) messages. Captures the
-    buttons, or — on timeout / no-options — surfaces the bot's own message text
-    so the web shows the same content the bot returns."""
+    """Block repeatedly on the search-bot chat until we see its reply. The
+    search bot answers by sending a confirmation text followed by the actual
+    MEDIA FILE messages (each a downloadable movie). We collect those files as
+    the selectable options. Falls back to inline buttons if it ever returns an
+    inline keyboard, or surfaces the bot's own text on timeout."""
     state = _anymovie_state.get(rid)
     if not state:
         return
     peer = state.get("peer")
+    sent_at = state.get("sent_at") or time.time()
 
     deadline = time.monotonic() + ANYMOVIE_TIMEOUT
     last_text = ""
-    last_signature = None
-    last_text_seen_at = None
     seen_bot_msgs = 0
-    seen_with_buttons = 0
+    seen_files = 0
+    last_capture = None
 
     while time.monotonic() < deadline:
+        if state.get("posted"):
+            return
+        media_opts = []
+        inline_opts = []
         try:
-            # Look through the most recent messages sent by the search bot.
-            async for m in client.iter_messages(peer, limit=6):
+            # Look through the search bot's most recent messages (newest first).
+            async for m in client.iter_messages(peer, limit=20):
                 if m.out:
                     continue
                 sender = await m.get_sender()
                 uname = (getattr(sender, "username", "") or "").lower()
                 if uname != ANYMOVIE_BOT.lower():
                     continue
+                mtime = getattr(m, "date", None)
+                if mtime is not None and mtime.timestamp() < sent_at - 5:
+                    continue  # stale message from before this search
 
                 seen_bot_msgs += 1
-                buttons = _anymovie_extract_buttons(m)
 
-                state["msg_id"] = m.id
-                state["buttons"] = buttons
-                state["text"] = m.message or m.text or ""
+                # Media FILE options: each is a movie the user can pick.
+                if m.media is not None:
+                    cap = (m.message or m.text or "").strip()
+                    if not cap:
+                        cap = f"File {len(media_opts) + 1}"
+                    seen_files += 1
+                    media_opts.append({"label": cap, "msg_id": m.id})
 
-                if buttons:
-                    seen_with_buttons += 1
-                    _anymovie_post_buttons(rid, buttons)
-                    return
+                # Inline keyboard options (if the bot ever uses them).
+                for r_i, row in enumerate(m.buttons or []):
+                    for c_i, b in enumerate(row):
+                        inline_opts.append({
+                            "label": getattr(b, "text", None) or f"Option {c_i + 1}",
+                            "callback": getattr(b, "data", None),
+                            "url": getattr(b, "url", None),
+                            "row": r_i,
+                            "col": c_i,
+                        })
 
-                # The bot replied but without option buttons yet — it may be a
-                # 'searching…' placeholder that gets edited into a button menu,
-                # or plain text (e.g. no match / ask to refine). Keep watching,
-                # but remember the message content for the timeout fallback.
-                sig = (m.id, state["text"].strip())
-                if sig != last_signature:
-                    last_signature = sig
-                    last_text = state["text"].strip()
-                    last_text_seen_at = time.monotonic()
+                # Track the newest text (confirmation / no-result) for fallback.
+                txt = (m.message or m.text or "").strip()
+                if txt:
+                    last_text = txt
+
+            choice = inline_opts or media_opts
+            if choice:
+                state["buttons"] = choice
+                if inline_opts:
+                    state["mode"] = "button"
+                else:
+                    state["mode"] = "file"
+                _anymovie_post_buttons(rid, choice)
+                return
         except Exception as e:
             logger.warning("AnyMovie reply-wait error: %s", e)
 
@@ -1423,24 +1449,28 @@ async def _await_anymovie_reply(client, rid):
     detail = (last_text or "").strip()
     if not detail:
         detail = "No options found. Try a different spelling."
-    detail += f" [bot msgs: {seen_bot_msgs}, with buttons: {seen_with_buttons}]"
+    detail += f" [bot msgs: {seen_bot_msgs}, files: {seen_files}]"
     _anymovie_post_buttons(rid, [], detail)
 
 
-def _anymovie_post_buttons(rid, buttons, error_text=None):
-    """Post captured labels (or an error) to the website for the web to render.
-    On success the state is KEPT so a later button tap can re-tap the reply."""
-    labels = [{"label": b["label"]} for b in buttons]
-    if buttons:
-        api_request("/api/anymovie/buttons", "POST",
-                    {"requestId": rid, "buttons": labels}, config.boss_secret)
-        logger.info("AnyMovie: captured %d button(s) for %s", len(buttons), rid)
-    else:
+def _anymovie_post_buttons(rid, options, error_text=None):
+    """Post captured options (labels + index) to the website. On success the
+    full option list is KEPT in state so a later select can reference it."""
+    if not options:
         api_request("/api/anymovie/buttons", "POST",
                     {"requestId": rid, "buttons": [], "error": error_text or "No options found. Try a different spelling."},
                     config.boss_secret)
         _anymovie_state.pop(rid, None)
         _anymovie_sent.discard(rid)
+        return
+    labels = [{"label": o["label"]} for o in options]
+    api_request("/api/anymovie/buttons", "POST",
+                {"requestId": rid, "buttons": labels}, config.boss_secret)
+    st = _anymovie_state.get(rid)
+    if st is not None:
+        st["posted"] = True
+    logger.info("AnyMovie: captured %d option(s) for %s (mode=%s)", len(options), rid,
+                _anymovie_state.get(rid, {}).get("mode"))
 
 
 async def _anymovie_tap(client, app, rid, idx):
@@ -1454,6 +1484,33 @@ async def _anymovie_tap(client, app, rid, idx):
     if idx < 0 or idx >= len(buttons):
         return None, "invalid button index"
     chosen = buttons[idx]
+
+    # FILE mode: the search bot already sent the chosen media file (a movie).
+    # Forward that exact message to the archive channel once so it becomes a
+    # watchable card. No tapping is needed — the file is right there.
+    if chosen.get("msg_id"):
+        media_msg_id = chosen["msg_id"]
+        try:
+            peer = state.get("peer")
+            media_msg = await client.get_messages(peer, ids=media_msg_id)
+            if media_msg is None or media_msg.media is None:
+                return None, "chosen file message not available"
+            tg_link = ""
+            if TG_STORAGE_CHANNEL and TG_STORAGE_CHANNEL_ID and BOT_USERNAME:
+                try:
+                    fwd = await app.bot.forward_message(
+                        TG_STORAGE_CHANNEL, from_chat_id=peer, message_id=media_msg.id)
+                    chat_id_n = str(TG_STORAGE_CHANNEL_ID).lstrip("-")
+                    tg_link = f"https://t.me/{BOT_USERNAME}?start=file_{chat_id_n}_{fwd.message_id}"
+                except Exception as e:
+                    logger.warning("AnyMovie: file archive forward failed: %s", e)
+            state["tg_link"] = tg_link
+            if not tg_link:
+                return None, "could not archive the file"
+            return tg_link, None
+        except Exception as e:
+            logger.warning("AnyMovie file select error: %s", e)
+            return None, f"could not archive the file: {e}"
 
     # If the chosen button is a URL button, use it directly (common for
     # "Download" buttons on search bots).
