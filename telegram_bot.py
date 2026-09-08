@@ -1252,7 +1252,8 @@ async def anymovie_poller(app: Application):
                         else:
                             api_request("/api/anymovie/select-result", "POST",
                                         {"requestId": rid, "status": "done", "resultUrl": result_url,
-                                         "save": True, "title": _query, "telegramUrl": _tg},
+                                         "save": True, "title": _query, "telegramUrl": _tg,
+                                         "instantGet": True},
                                         config.boss_secret)
                         _anymovie_state.pop(rid, None)
                         _anymovie_sent.discard(rid)
@@ -1450,8 +1451,9 @@ async def _anymovie_tap(client, app, rid, idx):
                     break
 
         # 3) If the tapped button produced a FILE (media), forward it to the
-        #    archive channel and turn the deep-link into a direct link via the
-        #    link generator, mirroring Instant Get.
+        #    archive channel exactly once so the file lives in the bot and gets
+        #    a deep-link. The /dl/ link is NOT resolved here — the card's own
+        #    instant-get (secretary_poller) forwards to the link bot once.
         if not result_url:
             media_msg = None
             for src in (tapped, latest):
@@ -1470,14 +1472,9 @@ async def _anymovie_tap(client, app, rid, idx):
                 except Exception as e:
                     logger.warning("AnyMovie: archive forward failed: %s", e)
             state["tg_link"] = tg_link
-            if tg_link:
-                # Resolve a direct download link through the link generator bot.
-                if LINK_GENERATOR_BOT and user_client_available():
-                    result_url = await _anymovie_resolve_direct(client, tg_link)
-                if not result_url:
-                    result_url = tg_link
-            else:
+            if not tg_link:
                 return None, "could not archive the file"
+            result_url = tg_link
 
         if not result_url:
             return None, "could not resolve a link for the chosen option"
@@ -1485,46 +1482,6 @@ async def _anymovie_tap(client, app, rid, idx):
     except Exception as e:
         logger.warning("AnyMovie tap error: %s", e)
         return None, str(e)
-
-
-def user_client_available():
-    global _user_client
-    return _user_client is not None
-
-
-async def _anymovie_resolve_direct(client, telegram_url):
-    """Relay the archived deep-link to the link generator bot (like Instant Get)
-    and return a direct /dl/ URL, or None if it can't be resolved."""
-    if not LINK_GENERATOR_BOT:
-        return None
-    try:
-        from_chat_id = msg_id = None
-        if telegram_url and "start=file_" in telegram_url:
-            payload = telegram_url.split("start=file_")[1]
-            parts = payload.split("_")
-            from_chat_id, msg_id = int(parts[0]), int(parts[1])
-        if from_chat_id and msg_id:
-            sent = await client.forward_messages(LINK_GENERATOR_BOT, messages=msg_id, from_peer=from_chat_id)
-        else:
-            sent = await client.send_message(LINK_GENERATOR_BOT, telegram_url or "")
-        if sent is None:
-            return None
-        # Wait for the reply with the /dl/ link.
-        await asyncio.sleep(4)
-        async for m in client.iter_messages(LINK_GENERATOR_BOT, limit=3):
-            txt = m.message or m.text or ""
-            for u in re.findall(r'https?://[^\s<>"\'\\]+', txt):
-                if "/dl/" in u or "/download" in u.lower():
-                    return u
-            for row in (m.buttons or []):
-                for b in row:
-                    u = getattr(b, "url", None)
-                    if u and "/dl/" in u:
-                        return u
-        return None
-    except Exception as e:
-        logger.warning("AnyMovie: direct-link resolve failed: %s", e)
-        return None
 
 
 # ── UI helpers ─────────────────────────────────────────────────────
