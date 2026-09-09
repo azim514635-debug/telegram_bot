@@ -1781,8 +1781,8 @@ async def _anymovie_tap(client, app, rid, idx):
                 pass
 
         if media_msg is None:
-            # Last resort: check if tapped callback answer has useful info.
-            answer_txt = getattr(tapped, "message", None) or ""
+            # Last resort: bot said something useful.
+            answer_txt = "no file received"
             return None, f"no file or link returned after tapping (bot said: {answer_txt[:100]})"
 
         # Forward the actual message to the card bot — no re-upload.
