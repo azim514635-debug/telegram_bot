@@ -1701,14 +1701,32 @@ async def _anymovie_tap(client, app, rid, idx):
             return None, "search reply message no longer available"
 
         # 1) Tap the chosen inline button.
+        #    Prefer callback data (exact match) over row/col (can be wrong).
         r_ = chosen.get("row", 0)
         c_ = chosen.get("col", 0)
+        callback_data = chosen.get("callback")
         try:
-            tapped = await message.click(r_, c_)
-            logger.info("AnyMovie: tapped button row=%d col=%d rid=%s answer=%s", r_, c_, rid,
-                        getattr(tapped, "message", None) or "no answer")
+            if callback_data:
+                # Convert hex string back to bytes if needed.
+                if isinstance(callback_data, str):
+                    try:
+                        callback_data = bytes.fromhex(callback_data)
+                    except ValueError:
+                        callback_data = callback_data.encode()
+                # Use Telethon's Raw API to tap by exact callback data.
+                from telethon import types, functions
+                await client(functions.messages.GetBotCallbackAnswerRequest(
+                    peer=state["peer"],
+                    msg_id=msg_id,
+                    data=callback_data
+                ))
+                logger.info("AnyMovie: tapped button by callback data rid=%s data=%s", rid, callback_data[:20] if callback_data else "?")
+            else:
+                # Fallback: tap by row/col position.
+                await message.click(r_, c_)
+                logger.info("AnyMovie: tapped button by row=%d col=%d rid=%s", r_, c_, rid)
         except Exception as e:
-            return None, f"could not tap button at row={r_} col={c_}: {e}"
+            return None, f"could not tap button: {e}"
 
         # 2) Wait for the file to arrive as a NEW message from the bot.
         #    tapped is BotCallbackAnswer (no .media) — the actual file arrives
