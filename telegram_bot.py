@@ -1717,48 +1717,69 @@ async def _anymovie_tap(client, app, rid, idx):
         if message is None:
             return None, "search reply message no longer available"
 
-        # 1) Tap the chosen inline button.
-        #    Prefer callback data (exact match) over row/col (can be wrong).
+        # 0) Record the newest message ID BEFORE tapping, so we only grab
+        #    messages that arrive AFTER the tap (not old unrelated ones).
+        pre_tap_max_id = 0
+        try:
+            async for m in client.iter_messages(state["peer"], limit=1):
+                pre_tap_max_id = m.id
+                break
+        except Exception:
+            pass
+        logger.info("AnyMovie: pre_tap_max_id=%s for rid=%s", pre_tap_max_id, rid)
+
+        # 1) Tap the chosen inline button using callback data.
         r_ = chosen.get("row", 0)
         c_ = chosen.get("col", 0)
         callback_data = chosen.get("callback")
+        tap_ok = False
         try:
             if callback_data:
-                # Convert hex string back to bytes if needed.
                 if isinstance(callback_data, str):
                     try:
                         callback_data = bytes.fromhex(callback_data)
                     except ValueError:
                         callback_data = callback_data.encode()
-                # Use Telethon's Raw API to tap by exact callback data.
                 from telethon import types, functions
-                await client(functions.messages.GetBotCallbackAnswerRequest(
+                answer = await client(functions.messages.GetBotCallbackAnswerRequest(
                     peer=state["peer"],
                     msg_id=msg_id,
                     data=callback_data
                 ))
-                logger.info("AnyMovie: tapped button by callback data rid=%s data=%s", rid, callback_data[:20] if callback_data else "?")
+                logger.info("AnyMovie: tapped by callback data rid=%s alert=%s", rid,
+                            getattr(answer, "message", None) or "none")
+                tap_ok = True
             else:
-                # Fallback: tap by row/col position.
                 await message.click(r_, c_)
-                logger.info("AnyMovie: tapped button by row=%d col=%d rid=%s", r_, c_, rid)
+                logger.info("AnyMovie: tapped by row=%d col=%d rid=%s", r_, c_, rid)
+                tap_ok = True
         except Exception as e:
+            logger.warning("AnyMovie: tap attempt failed rid=%s err=%s", rid, e)
             return None, f"could not tap button: {e}"
 
+        if not tap_ok:
+            return None, "tap did not complete"
+
         # 2) Wait for the file to arrive as a NEW message from the bot.
-        #    tapped is BotCallbackAnswer (no .media) — the actual file arrives
-        #    as a separate message after the callback.
         await asyncio.sleep(5)
 
-        # 3) Grab the newest message(s) from the chat.
+        # 3) Grab ONLY messages newer than pre_tap_max_id (post-tap messages).
         latest = None
         try:
-            async for m in client.iter_messages(state["peer"], limit=5):
-                if m.id != msg_id:  # skip the original button message
+            async for m in client.iter_messages(state["peer"], limit=10,
+                                                 min_id=pre_tap_max_id):
+                if m.id > pre_tap_max_id:
                     latest = m
                     break
         except Exception:
             pass
+
+        if latest:
+            logger.info("AnyMovie: post-tap message id=%s media=%s text=%s rid=%s",
+                        latest.id, bool(latest.media),
+                        (latest.message or "")[:50], rid)
+        else:
+            logger.info("AnyMovie: NO post-tap message found rid=%s (pre_tap_max_id=%s)", rid, pre_tap_max_id)
 
         # 4) Check for a URL in the latest message (some bots reply with links).
         result_url = None
