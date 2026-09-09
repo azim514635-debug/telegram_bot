@@ -1703,63 +1703,59 @@ async def _anymovie_tap(client, app, rid, idx):
         # 1) Tap the chosen inline button.
         r_ = chosen.get("row", 0)
         c_ = chosen.get("col", 0)
-        tapped = []
         try:
             tapped = await message.click(r_, c_)
-            logger.info("AnyMovie: tapped button row=%d col=%d rid=%s", r_, c_, rid)
+            logger.info("AnyMovie: tapped button row=%d col=%d rid=%s answer=%s", r_, c_, rid,
+                        getattr(tapped, "message", None) or "no answer")
         except Exception as e:
             return None, f"could not tap button at row={r_} col={c_}: {e}"
 
-        # 2) Wait longer for the file to arrive (search bots can be slow).
+        # 2) Wait for the file to arrive as a NEW message from the bot.
+        #    tapped is BotCallbackAnswer (no .media) — the actual file arrives
+        #    as a separate message after the callback.
         await asyncio.sleep(5)
 
-        # 3) Grab the newest message — could be in tapped result or latest.
+        # 3) Grab the newest message(s) from the chat.
         latest = None
         try:
-            async for m in client.iter_messages(state["peer"], limit=3):
+            async for m in client.iter_messages(state["peer"], limit=5):
                 if m.id != msg_id:  # skip the original button message
                     latest = m
                     break
         except Exception:
             pass
 
-        # 4) Check for a URL first (some bots reply with download links).
+        # 4) Check for a URL in the latest message (some bots reply with links).
         result_url = None
-        for src in (tapped, latest):
-            if src is None:
-                continue
-            txt = (getattr(src, "message", None) or getattr(src, "text", None) or "")
+        if latest:
+            txt = (getattr(latest, "message", None) or getattr(latest, "text", None) or "")
             for u in re.findall(r'https?://[^\s<>"\'\\]+', txt):
                 if "/dl/" in u or "/download" in u.lower() or "herokuapp" in u:
                     result_url = u
                     break
-            if result_url:
-                break
-            for row in (getattr(src, "buttons", None) or []):
-                for b in row:
-                    u = getattr(b, "url", None)
-                    if u and not u.startswith("https://t.me/"):
-                        result_url = u
+            if not result_url:
+                for row in (getattr(latest, "buttons", None) or []):
+                    for b in row:
+                        u = getattr(b, "url", None)
+                        if u and not u.startswith("https://t.me/"):
+                            result_url = u
+                            break
+                    if result_url:
                         break
-                if result_url:
-                    break
 
         # 5) If we got a URL, return it.
         if result_url:
             return result_url, None
 
-        # 6) No URL — look for a FILE and forward it to the card bot.
-        media_msg = None
-        for src in (tapped, latest):
-            if src is not None and src.media is not None:
-                media_msg = src
-                break
+        # 6) No URL — look for a FILE in the latest message and forward it.
+        media_msg = latest if (latest and latest.media is not None) else None
 
         if media_msg is None:
-            # Last resort: wait a bit more and check again.
-            await asyncio.sleep(3)
+            # Wait a bit more and check again — some bots are slow.
+            logger.info("AnyMovie: no file yet after tap, waiting more rid=%s", rid)
+            await asyncio.sleep(5)
             try:
-                async for m in client.iter_messages(state["peer"], limit=3):
+                async for m in client.iter_messages(state["peer"], limit=5):
                     if m.id != msg_id and m.media is not None:
                         media_msg = m
                         break
@@ -1767,7 +1763,9 @@ async def _anymovie_tap(client, app, rid, idx):
                 pass
 
         if media_msg is None:
-            return None, "no file or link returned after tapping"
+            # Last resort: check if tapped callback answer has useful info.
+            answer_txt = getattr(tapped, "message", None) or ""
+            return None, f"no file or link returned after tapping (bot said: {answer_txt[:100]})"
 
         # Forward the actual message to the card bot — no re-upload.
         tg_link = ""
