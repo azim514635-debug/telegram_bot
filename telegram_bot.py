@@ -1443,8 +1443,9 @@ async def _anymovie_on_event(event, edited=False):
                 break
         if not rid:
             return
-        state = _anymovie_state.get(rid)
-        if not state:
+    state = _anymovie_state.get(rid)
+    if not state:
+        logger.info("AnyMovie TAP: state not in memory for %s, trying DB reconstruction", rid)
             return
         if state.get("posted"):
             return
@@ -1639,6 +1640,7 @@ async def _anymovie_tap(client, app, rid, idx):
     """Tap the chosen button on the search bot's reply and forward the
     resulting file to the card-making bot via forward_messages (no re-upload).
     The card bot's handle_media detects #AM_<rid> and creates the card."""
+    logger.info("AnyMovie TAP: START rid=%s idx=%s state_in_mem=%s", rid, idx, rid in _anymovie_state)
     state = _anymovie_state.get(rid)
     if not state:
         # State may have been cleaned (bot restart / housekeeping).
@@ -1766,6 +1768,8 @@ async def _anymovie_tap(client, app, rid, idx):
 
         if callback_data:
             # Method A: Direct callback data (most reliable).
+            logger.info("AnyMovie TAP: attempting callback tap rid=%s data_type=%s data_len=%s msg_id=%s",
+                        rid, type(callback_data).__name__, len(callback_data) if callback_data else 0, msg_id)
             try:
                 from telethon import functions
                 answer = await client(functions.messages.GetBotCallbackAnswerRequest(
@@ -1773,12 +1777,12 @@ async def _anymovie_tap(client, app, rid, idx):
                     msg_id=msg_id,
                     data=callback_data
                 ))
-                logger.info("AnyMovie: TAPPED via callback data! rid=%s row=%d col=%d alert=%s",
-                            rid, target_row, target_col,
-                            getattr(answer, "message", None) or "none")
+                logger.info("AnyMovie TAP: SUCCESS via callback! rid=%s answer=%s alert=%s",
+                            rid, getattr(answer, "message", None) or "none",
+                            getattr(answer, "alert", None))
                 tapped = True
             except Exception as e:
-                logger.warning("AnyMovie: callback tap failed, trying click(): %s", e)
+                logger.warning("AnyMovie TAP: callback FAILED rid=%s err=%s", rid, e)
 
         if not tapped:
             # Method B: Telethon's click() with exact row/col from the FRESH message.
