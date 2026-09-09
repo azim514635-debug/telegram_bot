@@ -1443,9 +1443,8 @@ async def _anymovie_on_event(event, edited=False):
                 break
         if not rid:
             return
-    state = _anymovie_state.get(rid)
-    if not state:
-        logger.info("AnyMovie TAP: state not in memory for %s, trying DB reconstruction", rid)
+        state = _anymovie_state.get(rid)
+        if not state:
             return
         if state.get("posted"):
             return
