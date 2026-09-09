@@ -1791,26 +1791,9 @@ async def _anymovie_tap(client, app, rid, idx):
                 return None, f"both tap methods failed for button at row={target_row} col={target_col}: {e}"
 
         # 6) Wait for the file to arrive as a NEW message.
-        await asyncio.sleep(8)
-
-        # 7) Grab ONLY messages newer than pre_tap_max_id.
+        #    Search bots can be slow — poll multiple times.
         latest = None
-        try:
-            async for m in client.iter_messages(peer_entity, limit=10,
-                                                 min_id=pre_tap_max_id):
-                if m.id > pre_tap_max_id:
-                    latest = m
-                    break
-        except Exception:
-            pass
-
-        if latest:
-            logger.info("AnyMovie: post-tap msg id=%s media=%s text='%s' rid=%s",
-                        latest.id, bool(latest.media),
-                        (latest.message or "")[:80], rid)
-        else:
-            logger.info("AnyMovie: NO post-tap message rid=%s pre_tap_max_id=%s", rid, pre_tap_max_id)
-            # One more try with a longer wait.
+        for wait_attempt in range(6):
             await asyncio.sleep(5)
             try:
                 async for m in client.iter_messages(peer_entity, limit=10,
@@ -1821,8 +1804,17 @@ async def _anymovie_tap(client, app, rid, idx):
             except Exception:
                 pass
             if latest:
-                logger.info("AnyMovie: found post-tap msg on retry: id=%s media=%s rid=%s",
-                            latest.id, bool(latest.media), rid)
+                logger.info("AnyMovie: found post-tap msg on attempt %d: id=%s media=%s rid=%s",
+                            wait_attempt + 1, latest.id, bool(latest.media), rid)
+                break
+            logger.info("AnyMovie: waiting for post-tap message attempt %d/6 rid=%s", wait_attempt + 1, rid)
+
+        if latest:
+            logger.info("AnyMovie: post-tap msg id=%s media=%s text='%s' rid=%s",
+                        latest.id, bool(latest.media),
+                        (latest.message or "")[:80], rid)
+        else:
+            logger.warning("AnyMovie: NO post-tap message after 30s rid=%s pre_tap_max_id=%s", rid, pre_tap_max_id)
 
         # 8) Check for a URL in the post-tap message.
         result_url = None
