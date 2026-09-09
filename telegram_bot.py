@@ -259,6 +259,35 @@ def api_request(path, method="GET", data=None, boss_secret=""):
         return 0, {"error": str(e)}
 
 
+def _api_request_json(path, method="POST", data=None, boss_secret=""):
+    """Like api_request but sends JSON body so complex objects (lists, dicts)
+    are preserved correctly on the server side."""
+    url = BASE_URL + path
+    headers = {"Content-Type": "application/json"}
+    if boss_secret:
+        headers["x-boss-secret"] = boss_secret
+
+    body = None
+    if data:
+        body = json.dumps(data).encode("utf-8")
+
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            return resp.status, json.loads(raw)
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, {"error": raw}
+    except urllib.error.URLError as e:
+        return 0, {"error": str(e.reason)}
+    except Exception as e:
+        return 0, {"error": str(e)}
+
+
 def upload_link_api(title, url, thumbnail_url=""):
     entry = {"title": title, "url": url, "thumbnailUrl": thumbnail_url}
     for _ in range(3):
@@ -1570,14 +1599,20 @@ def _anymovie_post_buttons(rid, options, error_text=None):
         if o.get("col") is not None:
             entry["col"] = o["col"]
         if o.get("callback"):
-            entry["callback"] = o["callback"]
+            cb = o["callback"]
+            if isinstance(cb, bytes):
+                entry["callback"] = cb.hex()
+            else:
+                entry["callback"] = cb
         if o.get("url"):
             entry["url"] = o["url"]
         if o.get("msg_id"):
             entry["msg_id"] = o["msg_id"]
         labels.append(entry)
-    api_request("/api/anymovie/buttons", "POST",
-                {"requestId": rid, "buttons": labels}, config.boss_secret)
+    # Use JSON body so the server receives buttons as an actual array,
+    # not a URL-encoded string representation.
+    _api_request_json("/api/anymovie/buttons", "POST",
+                      {"requestId": rid, "buttons": labels}, config.boss_secret)
     st = _anymovie_state.get(rid)
     if st is not None:
         st["posted"] = True
