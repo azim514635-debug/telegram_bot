@@ -1713,60 +1713,90 @@ async def _anymovie_tap(client, app, rid, idx):
         return None, "no message ID stored for button tap"
 
     try:
-        message = await client.get_messages(state["peer"], ids=msg_id)
+        # 1) Resolve the peer entity FRESH — don't rely on cached username.
+        peer_entity = None
+        try:
+            peer_entity = await client.get_entity(state["peer"])
+        except Exception as e:
+            logger.warning("AnyMovie: could not resolve peer %s: %s", state["peer"], e)
+            return None, f"could not resolve search bot: {e}"
+
+        # 2) Fetch the message FRESH and verify it has buttons.
+        message = await client.get_messages(peer_entity, ids=msg_id)
         if message is None:
             return None, "search reply message no longer available"
 
-        # 0) Record the newest message ID BEFORE tapping, so we only grab
-        #    messages that arrive AFTER the tap (not old unrelated ones).
+        # Verify buttons exist on the message.
+        if not message.buttons:
+            logger.warning("AnyMovie: message %s has no buttons! rid=%s", msg_id, rid)
+            return None, "message has no buttons to tap"
+
+        logger.info("AnyMovie: message %s has %d button rows, rid=%s",
+                    msg_id, len(message.buttons), rid)
+
+        # 3) Map stored button index → actual Telethon button object.
+        #    Flatten all buttons and match by callback data OR row/col.
+        all_buttons = []
+        for r_i, row in enumerate(message.buttons):
+            for c_i, btn in enumerate(row):
+                all_buttons.append({"btn": btn, "row": r_i, "col": c_i})
+
+        logger.info("AnyMovie: flattened %d buttons from message, chosen idx=%d", len(all_buttons), idx)
+
+        if idx >= len(all_buttons):
+            return None, f"button index {idx} out of range (message has {len(all_buttons)} buttons)"
+
+        target_btn = all_buttons[idx]["btn"]
+        target_row = all_buttons[idx]["row"]
+        target_col = all_buttons[idx]["col"]
+
+        # 4) Record the newest message ID BEFORE tapping.
         pre_tap_max_id = 0
         try:
-            async for m in client.iter_messages(state["peer"], limit=1):
+            async for m in client.iter_messages(peer_entity, limit=1):
                 pre_tap_max_id = m.id
                 break
         except Exception:
             pass
-        logger.info("AnyMovie: pre_tap_max_id=%s for rid=%s", pre_tap_max_id, rid)
+        logger.info("AnyMovie: pre_tap_max_id=%s rid=%s", pre_tap_max_id, rid)
 
-        # 1) Tap the chosen inline button using callback data.
-        r_ = chosen.get("row", 0)
-        c_ = chosen.get("col", 0)
-        callback_data = chosen.get("callback")
-        tap_ok = False
-        try:
-            if callback_data:
-                if isinstance(callback_data, str):
-                    try:
-                        callback_data = bytes.fromhex(callback_data)
-                    except ValueError:
-                        callback_data = callback_data.encode()
-                from telethon import types, functions
+        # 5) Tap the button — try callback data first, then Telethon click.
+        tapped = False
+        callback_data = getattr(target_btn, "data", None)
+
+        if callback_data:
+            # Method A: Direct callback data (most reliable).
+            try:
+                from telethon import functions
                 answer = await client(functions.messages.GetBotCallbackAnswerRequest(
-                    peer=state["peer"],
+                    peer=peer_entity,
                     msg_id=msg_id,
                     data=callback_data
                 ))
-                logger.info("AnyMovie: tapped by callback data rid=%s alert=%s", rid,
+                logger.info("AnyMovie: TAPPED via callback data! rid=%s row=%d col=%d alert=%s",
+                            rid, target_row, target_col,
                             getattr(answer, "message", None) or "none")
-                tap_ok = True
-            else:
-                await message.click(r_, c_)
-                logger.info("AnyMovie: tapped by row=%d col=%d rid=%s", r_, c_, rid)
-                tap_ok = True
-        except Exception as e:
-            logger.warning("AnyMovie: tap attempt failed rid=%s err=%s", rid, e)
-            return None, f"could not tap button: {e}"
+                tapped = True
+            except Exception as e:
+                logger.warning("AnyMovie: callback tap failed, trying click(): %s", e)
 
-        if not tap_ok:
-            return None, "tap did not complete"
+        if not tapped:
+            # Method B: Telethon's click() with exact row/col from the FRESH message.
+            try:
+                await message.click(target_row, target_col)
+                logger.info("AnyMovie: TAPPED via click(%d,%d)! rid=%s", target_row, target_col, rid)
+                tapped = True
+            except Exception as e:
+                logger.warning("AnyMovie: click() also failed: %s", e)
+                return None, f"both tap methods failed for button at row={target_row} col={target_col}: {e}"
 
-        # 2) Wait for the file to arrive as a NEW message from the bot.
-        await asyncio.sleep(5)
+        # 6) Wait for the file to arrive as a NEW message.
+        await asyncio.sleep(8)
 
-        # 3) Grab ONLY messages newer than pre_tap_max_id (post-tap messages).
+        # 7) Grab ONLY messages newer than pre_tap_max_id.
         latest = None
         try:
-            async for m in client.iter_messages(state["peer"], limit=10,
+            async for m in client.iter_messages(peer_entity, limit=10,
                                                  min_id=pre_tap_max_id):
                 if m.id > pre_tap_max_id:
                     latest = m
@@ -1775,13 +1805,26 @@ async def _anymovie_tap(client, app, rid, idx):
             pass
 
         if latest:
-            logger.info("AnyMovie: post-tap message id=%s media=%s text=%s rid=%s",
+            logger.info("AnyMovie: post-tap msg id=%s media=%s text='%s' rid=%s",
                         latest.id, bool(latest.media),
-                        (latest.message or "")[:50], rid)
+                        (latest.message or "")[:80], rid)
         else:
-            logger.info("AnyMovie: NO post-tap message found rid=%s (pre_tap_max_id=%s)", rid, pre_tap_max_id)
+            logger.info("AnyMovie: NO post-tap message rid=%s pre_tap_max_id=%s", rid, pre_tap_max_id)
+            # One more try with a longer wait.
+            await asyncio.sleep(5)
+            try:
+                async for m in client.iter_messages(peer_entity, limit=10,
+                                                     min_id=pre_tap_max_id):
+                    if m.id > pre_tap_max_id:
+                        latest = m
+                        break
+            except Exception:
+                pass
+            if latest:
+                logger.info("AnyMovie: found post-tap msg on retry: id=%s media=%s rid=%s",
+                            latest.id, bool(latest.media), rid)
 
-        # 4) Check for a URL in the latest message (some bots reply with links).
+        # 8) Check for a URL in the post-tap message.
         result_url = None
         if latest:
             txt = (getattr(latest, "message", None) or getattr(latest, "text", None) or "")
@@ -1799,57 +1842,40 @@ async def _anymovie_tap(client, app, rid, idx):
                     if result_url:
                         break
 
-        # 5) If we got a URL, return it.
         if result_url:
             return result_url, None
 
-        # 6) No URL — look for a FILE in the latest message and forward it.
+        # 9) Look for a FILE in the post-tap message.
         media_msg = latest if (latest and latest.media is not None) else None
 
         if media_msg is None:
-            # Wait a bit more and check again — some bots are slow.
-            logger.info("AnyMovie: no file yet after tap, waiting more rid=%s", rid)
-            await asyncio.sleep(5)
-            try:
-                async for m in client.iter_messages(state["peer"], limit=5):
-                    if m.id != msg_id and m.media is not None:
-                        media_msg = m
-                        break
-            except Exception:
-                pass
-
-        if media_msg is None:
-            # Last resort: bot said something useful.
-            answer_txt = "no file received"
-            return None, f"no file or link returned after tapping (bot said: {answer_txt[:100]})"
+            logger.warning("AnyMovie: no file in post-tap message rid=%s", rid)
+            return None, "no file or link returned after tapping"
 
         # Forward the actual message to the card bot — no re-upload.
         tg_link = ""
         try:
-            await client.forward_messages(BOT_USERNAME, messages=media_msg.id, from_peer=state["peer"])
-            logger.info("AnyMovie: forwarded INLINE file to bot rid=%s msg_id=%s", rid, media_msg.id)
-            # Register pending forward so handle_media can link the card.
+            await client.forward_messages(BOT_USERNAME, messages=media_msg.id, from_peer=peer_entity)
+            logger.info("AnyMovie: forwarded file to bot rid=%s msg_id=%s", rid, media_msg.id)
             _api_request_json("/api/anymovie/pending-forward", "POST",
                               {"requestId": rid}, config.boss_secret)
         except Exception as e:
-            logger.warning("AnyMovie: INLINE forward failed, fallback send_file: %s", e)
+            logger.warning("AnyMovie: forward failed, fallback send_file: %s", e)
             try:
                 await client.send_file(BOT_USERNAME, media_msg.media, caption=f"#AM_{rid}")
-                logger.info("AnyMovie: INLINE send_file fallback rid=%s", rid)
             except Exception as e2:
-                logger.warning("AnyMovie: INLINE send_file also failed: %s", e2)
+                logger.warning("AnyMovie: send_file also failed: %s", e2)
 
-        # Also archive to storage channel for deep-link.
+        # Archive to storage channel for deep-link.
         if TG_STORAGE_CHANNEL and TG_STORAGE_CHANNEL_ID and BOT_USERNAME:
             try:
                 fwd = await client.forward_messages(
-                    TG_STORAGE_CHANNEL, messages=media_msg.id, from_peer=state["peer"])
+                    TG_STORAGE_CHANNEL, messages=media_msg.id, from_peer=peer_entity)
                 chat_id_n = str(TG_STORAGE_CHANNEL_ID).lstrip("-")
                 fwd_msg_id = fwd.id if hasattr(fwd, "id") else (fwd[0].id if isinstance(fwd, list) and fwd else media_msg.id)
                 tg_link = f"https://t.me/{BOT_USERNAME}?start=file_{chat_id_n}_{fwd_msg_id}"
-                logger.info("AnyMovie: INLINE archived rid=%s fwd_msg_id=%s", rid, fwd_msg_id)
             except Exception as e:
-                logger.warning("AnyMovie: INLINE archive failed: %s", e)
+                logger.warning("AnyMovie: archive failed: %s", e)
 
         state["tg_link"] = tg_link
         return "waiting", None
