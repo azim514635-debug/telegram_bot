@@ -1330,10 +1330,6 @@ async def anymovie_poller(app: Application):
                     idx = req.get("pendingIndex")
                     if not rid or idx is None:
                         continue
-                    # Skip if state already cleaned (prevent double-tap).
-                    if rid not in _anymovie_state:
-                        logger.info("AnyMovie: skipping tap for %s (state already cleaned)", rid)
-                        continue
                     logger.info("AnyMovie: tapping button %s for %s", idx, rid)
                     try:
                         result_url, err = await _anymovie_tap(user_client, app, rid, int(idx))
@@ -1645,10 +1641,31 @@ async def _anymovie_tap(client, app, rid, idx):
     The card bot's handle_media detects #AM_<rid> and creates the card."""
     state = _anymovie_state.get(rid)
     if not state:
-        return None, "buttons state missing (search may have timed out)"
+        # State may have been cleaned (bot restart / housekeeping).
+        # Try to reconstruct minimal state from the DB so the tap can proceed.
+        try:
+            st, body = api_request(f"/api/anymovie/buttons-state/{rid}", "GET",
+                                   boss_secret=config.boss_secret)
+            if st == 200 and isinstance(body, dict) and body.get("buttons"):
+                state = {
+                    "peer": ANYMOVIE_BOT,
+                    "msg_id": body.get("msg_id"),
+                    "buttons": body["buttons"],
+                    "mode": body.get("mode", "button"),
+                    "at": time.monotonic(),
+                    "posted": True,
+                    "tg_link": None,
+                }
+                _anymovie_state[rid] = state
+                logger.info("AnyMovie: reconstructed state for %s from DB (%d buttons)", rid, len(body["buttons"]))
+            else:
+                return None, "buttons state missing and cannot reconstruct (search may have timed out)"
+        except Exception as e:
+            return None, f"buttons state missing (search may have timed out): {e}"
+
     buttons = state.get("buttons") or []
     if idx < 0 or idx >= len(buttons):
-        return None, "invalid button index"
+        return None, f"invalid button index {idx} (have {len(buttons)} buttons)"
     chosen = buttons[idx]
 
     logger.info("AnyMovie tap: rid=%s idx=%d mode=%s label=%s",
