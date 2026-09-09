@@ -754,6 +754,17 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if title_cleaned:
             title = title_cleaned.splitlines()[0][:80]
         logger.info("AnyMovie: handle_media detected marker rid=%s title=%s", anymovie_rid, title)
+    else:
+        # No #AM_ marker — check if this is a pending forward from Any Movie tap.
+        # forward_messages can't carry captions, so we track pending forwards.
+        try:
+            st, body = api_request("/api/anymovie/pending-forward/check", "GET",
+                                   boss_secret=config.boss_secret)
+            if st == 200 and isinstance(body, dict) and body.get("requestId"):
+                anymovie_rid = body["requestId"]
+                logger.info("AnyMovie: handle_media matched pending forward rid=%s", anymovie_rid)
+        except Exception:
+            pass
 
     status_msg = await msg.reply_text(f"Receiving <b>{escape_html(title)}</b>…", parse_mode="HTML")
 
@@ -1295,7 +1306,8 @@ async def anymovie_poller(app: Application):
                     query = req.get("query", "")
                     if not rid or not query:
                         continue
-                    if rid in _anymovie_sent:
+                    # Skip if already sent or if state exists (prevents spam on restart).
+                    if rid in _anymovie_sent or rid in _anymovie_state:
                         continue
                     _anymovie_sent.add(rid)  # claim BEFORE any await to avoid races
                     logger.info("AnyMovie: searching '%s' (id=%s)", query, rid)
@@ -1304,17 +1316,23 @@ async def anymovie_poller(app: Application):
                     except Exception as e:
                         logger.exception("AnyMovie search error %s", rid)
                         _anymovie_sent.discard(rid)
+                        _anymovie_state.pop(rid, None)
                         api_request("/api/anymovie/buttons", "POST",
                                     {"requestId": rid, "buttons": [], "error": f"Search failed: {e}"},
                                     config.boss_secret)
 
-            # 2) Button taps -> re-tap the chosen button, resolve a temp link.
+            # 2) Button taps -> tap the chosen button, forward the file to the
+            #    card-making bot via forward_messages (no re-upload).
             st, body = api_request("/api/anymovie/select-pending", "GET", boss_secret=config.boss_secret)
             if st == 200 and isinstance(body, dict):
                 for req in body.get("requests", []):
                     rid = req.get("id", "")
                     idx = req.get("pendingIndex")
                     if not rid or idx is None:
+                        continue
+                    # Skip if state already cleaned (prevent double-tap).
+                    if rid not in _anymovie_state:
+                        logger.info("AnyMovie: skipping tap for %s (state already cleaned)", rid)
                         continue
                     logger.info("AnyMovie: tapping button %s for %s", idx, rid)
                     try:
@@ -1323,11 +1341,13 @@ async def anymovie_poller(app: Application):
                         _query = req.get("query", "")
                         _tg = _st.get("tg_link", "")
                         if err:
+                            logger.info("AnyMovie tap error for %s: %s", rid, err)
                             api_request("/api/anymovie/select-result", "POST",
                                         {"requestId": rid, "status": "error", "error": err,
                                          "save": True, "title": _query}, config.boss_secret)
                         elif result_url == "waiting":
-                            # File sent to bot — card will be created by handle_media.
+                            # File forwarded to bot — card will be created by handle_media.
+                            logger.info("AnyMovie: file forwarded for %s, waiting for card", rid)
                             api_request("/api/anymovie/select-result", "POST",
                                         {"requestId": rid, "status": "waiting_for_card",
                                          "title": _query}, config.boss_secret)
@@ -1337,12 +1357,11 @@ async def anymovie_poller(app: Application):
                                          "save": True, "title": _query, "telegramUrl": _tg,
                                          "instantGet": True},
                                         config.boss_secret)
-                        _anymovie_state.pop(rid, None)
-                        _anymovie_sent.discard(rid)
                     except Exception as e:
-                        logger.exception("AnyMovie tap error %s", rid)
+                        logger.exception("AnyMovie tap exception %s", rid)
                         api_request("/api/anymovie/select-result", "POST",
                                     {"requestId": rid, "status": "error", "error": str(e)}, config.boss_secret)
+                    finally:
                         _anymovie_state.pop(rid, None)
                         _anymovie_sent.discard(rid)
 
@@ -1621,9 +1640,9 @@ def _anymovie_post_buttons(rid, options, error_text=None):
 
 
 async def _anymovie_tap(client, app, rid, idx):
-    """Tap the chosen button on the search bot's reply and return a temporary
-    download URL for the resulting file. Falls back to a t.me deep-link if a
-    direct URL can't be extracted."""
+    """Tap the chosen button on the search bot's reply and forward the
+    resulting file to the card-making bot via forward_messages (no re-upload).
+    The card bot's handle_media detects #AM_<rid> and creates the card."""
     state = _anymovie_state.get(rid)
     if not state:
         return None, "buttons state missing (search may have timed out)"
@@ -1635,41 +1654,43 @@ async def _anymovie_tap(client, app, rid, idx):
     logger.info("AnyMovie tap: rid=%s idx=%d mode=%s label=%s",
                 rid, idx, state.get("mode"), chosen.get("label", "?"))
 
-    # FILE mode: the search bot already sent the chosen media file (a movie).
-    # Send it to our bot with the #AM_ marker so handle_media creates the card
-    # via the existing pipeline (BIN archive + website card + Instant Get).
+    # FILE mode: the search bot already sent the chosen media file.
+    # Forward it directly to the card bot (no re-upload).
     if chosen.get("msg_id"):
         media_msg_id = chosen["msg_id"]
         try:
             peer = state.get("peer")
             media_msg = await client.get_messages(peer, ids=media_msg_id)
-            if media_msg is None or media_msg.media is None:
+            if media_msg is None:
                 return None, "chosen file message not available"
-            # Send file to bot with marker — handle_media will do BIN + card + Instant Get.
+            if media_msg.media is None:
+                return None, "chosen message has no media"
+            # Forward the actual message to the card bot — no re-upload.
             try:
-                await client.send_file(
-                    BOT_USERNAME,
-                    media_msg.media,
-                    caption=f"#AM_{rid}"
-                )
-                logger.info("AnyMovie: sent file to bot for card creation rid=%s", rid)
-                state["tg_link"] = ""
-                return "waiting", None
+                await client.forward_messages(BOT_USERNAME, messages=media_msg.id, from_peer=peer)
+                logger.info("AnyMovie: forwarded file to bot rid=%s msg_id=%s", rid, media_msg.id)
+                # Register pending forward so handle_media can link the card.
+                _api_request_json("/api/anymovie/pending-forward", "POST",
+                                  {"requestId": rid}, config.boss_secret)
             except Exception as e:
-                logger.warning("AnyMovie: failed to send file to bot for card: %s", e)
-                return None, f"failed to send file to bot: {e}"
+                # Fallback: send_file with marker if forward fails.
+                logger.warning("AnyMovie: forward failed, falling back to send_file: %s", e)
+                await client.send_file(BOT_USERNAME, media_msg.media, caption=f"#AM_{rid}")
+                logger.info("AnyMovie: send_file fallback for rid=%s", rid)
+            state["tg_link"] = ""
+            return "waiting", None
         except Exception as e:
             logger.warning("AnyMovie file select error: %s", e)
-            return None, f"could not archive the file: {e}"
+            return None, f"could not forward the file: {e}"
 
-    # If the chosen button is a URL button, use it directly (common for
-    # "Download" buttons on search bots).
+    # URL button: use it directly.
     if chosen.get("url"):
         u = chosen["url"]
         if u and not u.startswith("https://t.me/"):
             return u, None
 
-    # INLINE BUTTON mode: fetch the original message and tap the exact button.
+    # INLINE BUTTON mode: fetch the original message, tap the exact button,
+    # wait for the file response, then forward it to the card bot.
     msg_id = state.get("msg_id")
     if not msg_id:
         return None, "no message ID stored for button tap"
@@ -1679,31 +1700,31 @@ async def _anymovie_tap(client, app, rid, idx):
         if message is None:
             return None, "search reply message no longer available"
 
-        # 1) Tap the chosen inline button using exact row/col from stored data.
+        # 1) Tap the chosen inline button.
         r_ = chosen.get("row", 0)
         c_ = chosen.get("col", 0)
         tapped = []
         try:
             tapped = await message.click(r_, c_)
-            logger.info("AnyMovie: tapped button at row=%d col=%d for rid=%s", r_, c_, rid)
+            logger.info("AnyMovie: tapped button row=%d col=%d rid=%s", r_, c_, rid)
         except Exception as e:
-            # Do NOT fall back to a random button — return a clear error.
             return None, f"could not tap button at row={r_} col={c_}: {e}"
 
-        # 2) After tapping, the file may come as a new message from the bot or
-        #    as a result in `tapped`. Give the reply handler a moment, then grab
-        #    the newest media message.
-        await asyncio.sleep(3)
+        # 2) Wait longer for the file to arrive (search bots can be slow).
+        await asyncio.sleep(5)
+
+        # 3) Grab the newest message — could be in tapped result or latest.
         latest = None
         try:
-            async for m in client.iter_messages(state["peer"], limit=1):
-                latest = m
-                break
+            async for m in client.iter_messages(state["peer"], limit=3):
+                if m.id != msg_id:  # skip the original button message
+                    latest = m
+                    break
         except Exception:
             pass
 
+        # 4) Check for a URL first (some bots reply with download links).
         result_url = None
-        # Prefer a direct URL found in the tapped result or latest message text.
         for src in (tapped, latest):
             if src is None:
                 continue
@@ -1714,7 +1735,6 @@ async def _anymovie_tap(client, app, rid, idx):
                     break
             if result_url:
                 break
-            # Any hyperlink button carrying a non-t.me URL is a candidate too.
             for row in (getattr(src, "buttons", None) or []):
                 for b in row:
                     u = getattr(b, "url", None)
@@ -1724,48 +1744,61 @@ async def _anymovie_tap(client, app, rid, idx):
                 if result_url:
                     break
 
-        # 3) If the tapped button produced a FILE (media), forward it to the
-        #    archive channel exactly once so the file lives in the bot and gets
-        #    a deep-link.
-        if not result_url:
-            media_msg = None
-            for src in (tapped, latest):
-                if src is not None and (src.media is not None):
-                    media_msg = src
-                    break
-            if media_msg is None:
-                return None, "no file or link returned after tapping"
+        # 5) If we got a URL, return it.
+        if result_url:
+            return result_url, None
 
-            tg_link = ""
-            if TG_STORAGE_CHANNEL and TG_STORAGE_CHANNEL_ID and BOT_USERNAME:
-                try:
-                    # Use Telethon user client for forwarding.
-                    fwd = await client.forward_messages(
-                        TG_STORAGE_CHANNEL, messages=media_msg.id, from_peer=state["peer"])
-                    chat_id_n = str(TG_STORAGE_CHANNEL_ID).lstrip("-")
-                    fwd_msg_id = fwd.id if hasattr(fwd, "id") else (fwd[0].id if isinstance(fwd, list) and fwd else media_msg.id)
-                    tg_link = f"https://t.me/{BOT_USERNAME}?start=file_{chat_id_n}_{fwd_msg_id}"
-                    logger.info("AnyMovie: INLINE archived rid=%s fwd_msg_id=%s", rid, fwd_msg_id)
-                except Exception as e:
-                    logger.warning("AnyMovie: archive forward failed: %s", e)
-            # Send file to bot with marker for card creation via existing pipeline.
+        # 6) No URL — look for a FILE and forward it to the card bot.
+        media_msg = None
+        for src in (tapped, latest):
+            if src is not None and src.media is not None:
+                media_msg = src
+                break
+
+        if media_msg is None:
+            # Last resort: wait a bit more and check again.
+            await asyncio.sleep(3)
             try:
-                await client.send_file(
-                    BOT_USERNAME,
-                    media_msg.media,
-                    caption=f"#AM_{rid}"
-                )
-                logger.info("AnyMovie: sent INLINE file to bot for card creation rid=%s", rid)
-            except Exception as e:
-                logger.warning("AnyMovie: failed to send INLINE file to bot for card: %s", e)
-            state["tg_link"] = tg_link
-            if not tg_link:
-                return None, "could not archive the file"
-            result_url = tg_link
+                async for m in client.iter_messages(state["peer"], limit=3):
+                    if m.id != msg_id and m.media is not None:
+                        media_msg = m
+                        break
+            except Exception:
+                pass
 
-        if not result_url:
-            return None, "could not resolve a link for the chosen option"
-        return result_url, None
+        if media_msg is None:
+            return None, "no file or link returned after tapping"
+
+        # Forward the actual message to the card bot — no re-upload.
+        tg_link = ""
+        try:
+            await client.forward_messages(BOT_USERNAME, messages=media_msg.id, from_peer=state["peer"])
+            logger.info("AnyMovie: forwarded INLINE file to bot rid=%s msg_id=%s", rid, media_msg.id)
+            # Register pending forward so handle_media can link the card.
+            _api_request_json("/api/anymovie/pending-forward", "POST",
+                              {"requestId": rid}, config.boss_secret)
+        except Exception as e:
+            logger.warning("AnyMovie: INLINE forward failed, fallback send_file: %s", e)
+            try:
+                await client.send_file(BOT_USERNAME, media_msg.media, caption=f"#AM_{rid}")
+                logger.info("AnyMovie: INLINE send_file fallback rid=%s", rid)
+            except Exception as e2:
+                logger.warning("AnyMovie: INLINE send_file also failed: %s", e2)
+
+        # Also archive to storage channel for deep-link.
+        if TG_STORAGE_CHANNEL and TG_STORAGE_CHANNEL_ID and BOT_USERNAME:
+            try:
+                fwd = await client.forward_messages(
+                    TG_STORAGE_CHANNEL, messages=media_msg.id, from_peer=state["peer"])
+                chat_id_n = str(TG_STORAGE_CHANNEL_ID).lstrip("-")
+                fwd_msg_id = fwd.id if hasattr(fwd, "id") else (fwd[0].id if isinstance(fwd, list) and fwd else media_msg.id)
+                tg_link = f"https://t.me/{BOT_USERNAME}?start=file_{chat_id_n}_{fwd_msg_id}"
+                logger.info("AnyMovie: INLINE archived rid=%s fwd_msg_id=%s", rid, fwd_msg_id)
+            except Exception as e:
+                logger.warning("AnyMovie: INLINE archive failed: %s", e)
+
+        state["tg_link"] = tg_link
+        return "waiting", None
     except Exception as e:
         logger.warning("AnyMovie tap error: %s", e)
         return None, str(e)
