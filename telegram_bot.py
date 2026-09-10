@@ -1784,14 +1784,10 @@ async def _anymovie_tap(client, app, rid, idx):
                 except Exception:
                     uname = ""
                 if uname == ANYMOVIE_BOT.lower():
-                    # Verify this response is for the correct request BEFORE capturing it
                     state_at_event = _anymovie_state.get(rid)
                     if state_at_event is None:
                         return
-                    # Additional verification: check if this matches the expected peer/entity
-                    # This prevents responses from being captured for wrong requests
-                    if m.sender_id and hasattr(m.sender, 'id'):
-                        # Verify this is actually the search bot
+                    if m.sender_id and hasattr(m.sender, 'id') and state_at_event.get("peer_id"):
                         if m.sender.id != state_at_event.get("peer_id"):
                             logger.debug("AnyMovie: ignoring response from wrong peer rid=%s", rid)
                             return
@@ -1815,7 +1811,7 @@ async def _anymovie_tap(client, app, rid, idx):
                     state_at_event = _anymovie_state.get(rid)
                     if state_at_event is None:
                         return
-                    if m.sender_id and hasattr(m.sender, 'id'):
+                    if m.sender_id and hasattr(m.sender, 'id') and state_at_event.get("peer_id"):
                         if m.sender.id != state_at_event.get("peer_id"):
                             logger.debug("AnyMovie: ignoring edit from wrong peer rid=%s", rid)
                             return
