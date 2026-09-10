@@ -1428,24 +1428,23 @@ async def _anymovie_on_event(event, edited=False):
 
         rid = None
         for rid_candidate, st in reversed(list(_anymovie_state.items())):
-            # Strict matching: peer_id must match exactly AND the request must be the most recent active one.
             if sender_peer_id is not None and st.get("peer_id") == sender_peer_id:
-                # Only match requests that were sent before this message arrived.
                 sent_at = st.get("sent_at") or 0
+                sent_msg_id = st.get("sent_id") or 0
+                # Message must be NEWER than our sent query
+                if message.id <= sent_msg_id:
+                    continue
                 msg_time = getattr(message, "date", None)
                 if msg_time is not None:
                     msg_ts = msg_time.timestamp() if hasattr(msg_time, "timestamp") else float(msg_time)
                 else:
                     msg_ts = time.time()
                 if msg_ts >= sent_at - 2:
-                    # Ensure this is the most recent active request - no other active request with same peer
                     other_active_rids = []
                     for other_rid, other_st in _anymovie_state.items():
                         if other_rid != rid_candidate and other_st.get("peer_id") == sender_peer_id:
-                            # Check if the other request is still active (not posted yet)
                             if not other_st.get("posted") and (other_st.get("sent_at") or 0) > sent_at:
                                 other_active_rids.append(other_rid)
-                    
                     if not other_active_rids:
                         rid = rid_candidate
                         break
@@ -1514,32 +1513,29 @@ def _anymovie_extract_buttons(message):
 
 
 async def _await_anymovie_reply(client, rid):
-    """Block repeatedly on the search-bot chat until we see its reply. The
-    search bot answers by sending a confirmation text followed by the actual
-    MEDIA FILE messages (each a downloadable movie). We collect those files as
-    the selectable options. Falls back to inline buttons if it ever returns an
-    inline keyboard, or surfaces the bot's own text on timeout."""
+    """Block repeatedly on the search-bot chat until we see its reply. Only
+    captures buttons from messages NEWER than the sent query (by msg ID),
+    and stops at the first message with buttons to avoid collecting old ones."""
     state = _anymovie_state.get(rid)
     if not state:
         return
     peer = state.get("peer")
     sent_at = state.get("sent_at") or time.time()
+    sent_msg_id = state.get("sent_id") or 0
 
     deadline = time.monotonic() + ANYMOVIE_TIMEOUT
     last_text = ""
     seen_bot_msgs = 0
     seen_files = 0
-    last_capture = None
-    found_at = None  # Timestamp when we first find options.
+    found_at = None
 
     while time.monotonic() < deadline:
         if state.get("posted"):
             return
-        media_opts = []
-        inline_opts = []
         found_msg_id = None
+        found_buttons = []
+        found_mode = None
         try:
-            # Look through the search bot's most recent messages (newest first).
             async for m in client.iter_messages(peer, limit=20):
                 if m.out:
                     continue
@@ -1547,69 +1543,67 @@ async def _await_anymovie_reply(client, rid):
                 uname = (getattr(sender, "username", "") or "").lower()
                 if uname != ANYMOVIE_BOT.lower():
                     continue
+                # Only accept messages NEWER than our sent query
+                if m.id <= sent_msg_id:
+                    continue
                 mtime = getattr(m, "date", None)
                 if mtime is not None:
                     mtime_ts = mtime.timestamp() if hasattr(mtime, "timestamp") else float(mtime)
                 else:
                     mtime_ts = time.time()
-                if mtime_ts < sent_at - 5:
-                    continue  # stale message from before this search
+                if mtime_ts < sent_at - 2:
+                    continue
 
                 seen_bot_msgs += 1
 
-                # Media FILE options: each is a movie the user can pick.
+                # Inline keyboard — stop immediately, this is the reply
+                if m.buttons:
+                    for r_i, row in enumerate(m.buttons):
+                        for c_i, b in enumerate(row):
+                            found_buttons.append({
+                                "label": getattr(b, "text", None) or f"Option {c_i + 1}",
+                                "callback": getattr(b, "data", None) if hasattr(b, "data") else None,
+                                "url": getattr(b, "url", None),
+                                "row": r_i,
+                                "col": c_i,
+                            })
+                    found_msg_id = m.id
+                    found_mode = "button"
+                    break  # Found buttons, stop looking
+
+                # Media file — collect and keep looking for more files
                 if m.media is not None:
                     cap = (m.message or m.text or "").strip()
                     if not cap:
-                        cap = f"File {len(media_opts) + 1}"
+                        cap = f"File {len(found_buttons) + 1}"
                     seen_files += 1
-                    media_opts.append({"label": cap, "msg_id": m.id})
+                    found_buttons.append({"label": cap, "msg_id": m.id})
                     if found_msg_id is None:
                         found_msg_id = m.id
+                    found_mode = "file"
 
-                # Inline keyboard options (if the bot ever uses them).
-                for r_i, row in enumerate(m.buttons or []):
-                    for c_i, b in enumerate(row):
-                        inline_opts.append({
-                            "label": getattr(b, "text", None) or f"Option {c_i + 1}",
-                            "callback": getattr(b, "data", None) if hasattr(b, "data") else None,
-                            "url": getattr(b, "url", None),
-                            "row": r_i,
-                            "col": c_i,
-                        })
-                    if found_msg_id is None:
-                        found_msg_id = m.id
-
-                # Track the newest text (confirmation / no-result) for fallback.
+                # Track newest text for timeout fallback
                 txt = (m.message or m.text or "").strip()
                 if txt:
                     last_text = txt
 
-            choice = inline_opts or media_opts
-            if choice:
-                state["buttons"] = choice
-                if inline_opts:
-                    state["mode"] = "button"
-                else:
-                    state["mode"] = "file"
-                # Store the message ID so _anymovie_tap can fetch it.
+            if found_buttons:
+                state["buttons"] = found_buttons
+                state["mode"] = found_mode
                 if found_msg_id:
                     state["msg_id"] = found_msg_id
-                # Collection window: wait 2s after first capture to collect
-                # any follow-up messages (search bots often edit/append).
                 if found_at is None:
                     found_at = time.monotonic()
                     await asyncio.sleep(2)
-                    continue  # Re-check for any additional messages
-                _anymovie_post_buttons(rid, choice)
+                    continue  # Wait for follow-up messages
+                _anymovie_post_buttons(rid, found_buttons)
                 return
         except Exception as e:
             logger.warning("AnyMovie reply-wait error: %s", e)
 
         await asyncio.sleep(2)
 
-    # Timeout: report whatever the bot said (spelling mistakes / 'no result'),
-    # so the web shows the bot's own content instead of an endless spinner.
+    # Timeout
     state_final = _anymovie_state.get(rid)
     if state_final and state_final.get("posted"):
         return
