@@ -1300,6 +1300,8 @@ async def anymovie_poller(app: Application):
         try:
             # 1) New searches -> send the movie name to the search bot, capture buttons.
             st, body = api_request("/api/anymovie/search-pending", "GET", boss_secret=config.boss_secret)
+            if st != 200:
+                logger.warning("AnyMovie poller: API returned status %s body=%s", st, str(body)[:200])
             if st == 200 and isinstance(body, dict):
                 for req in body.get("requests", []):
                     rid = req.get("id", "")
@@ -2704,11 +2706,18 @@ async def post_init(app: Application):
         BotCommand("cancel", "Cancel current operation"),
     ])
     logger.info("Bot commands registered.")
-    asyncio.create_task(camera_poller(app))
+    async def _start_camera(ctx):
+        await camera_poller(ctx.application)
+    async def _start_secretary(ctx):
+        await secretary_poller(ctx.application)
+    async def _start_anymovie(ctx):
+        await anymovie_poller(ctx.application)
+
+    app.job_queue.run_once(_start_camera, 10)
     logger.info("Camera delivery loop started.")
-    asyncio.create_task(secretary_poller(app))
+    app.job_queue.run_once(_start_secretary, 5)
     logger.info("Secretary Mode loop started.")
-    asyncio.create_task(anymovie_poller(app))
+    app.job_queue.run_once(_start_anymovie, 10)
     logger.info("AnyMovie loop started.")
 
     # Keep-alive to prevent Render free-tier spin-down after ~15 min of
