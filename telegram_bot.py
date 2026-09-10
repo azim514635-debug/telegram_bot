@@ -1770,7 +1770,7 @@ async def _anymovie_tap(client, app, rid, idx):
         response_msg = None
         response_event = asyncio.Event()
 
-        from telethon import events as _ev
+        from telethon import events
 
         async def _on_response(ev):
             nonlocal response_msg
