@@ -2728,7 +2728,7 @@ async def post_init(app: Application):
     )
     if _target and _target.startswith("http"):
         import urllib.request as _ur
-        async def _keepalive():
+        async def _keepalive(ctx=None):
             await asyncio.sleep(30)
             while True:
                 try:
@@ -2736,7 +2736,7 @@ async def post_init(app: Application):
                 except Exception:
                     pass
                 await asyncio.sleep(4 * 60)
-        asyncio.create_task(_keepalive())
+        app.job_queue.run_once(_keepalive, 30)
         logger.info("Keep-alive pinging %s every 4m.", _target)
 
 
