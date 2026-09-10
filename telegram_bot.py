@@ -1723,10 +1723,31 @@ async def _anymovie_tap(client, app, rid, idx):
             logger.warning("AnyMovie file select error: %s", e)
             return None, f"could not forward the file: {e}"
 
-    # URL button: use it directly.
+    # URL button — deep-link t.me buttons need /start sent directly;
+    # regular URLs are returned as-is.
     if chosen.get("url"):
         u = chosen["url"]
-        if u and not u.startswith("https://t.me/"):
+        if u and u.startswith("https://t.me/"):
+            # Deep link: https://t.me/BOT?start=PARAM
+            m = re.match(r'https?://t\.me/(\w+)\?start=(.+)', u)
+            if m:
+                target_bot = m.group(1)
+                start_param = m.group(2)
+                logger.info("AnyMovie: deep-link tap bot=%s start=%s rid=%s", target_bot, start_param, rid)
+                try:
+                    sent_start = await client.send_message(target_bot, f"/start {start_param}")
+                    logger.info("AnyMovie: /start sent to @%s msg_id=%s rid=%s", target_bot, sent_start.id, rid)
+                except Exception as e:
+                    logger.warning("AnyMovie: /start failed: %s, trying without /", e)
+                    try:
+                        sent_start = await client.send_message(target_bot, start_param)
+                        logger.info("AnyMovie: start_param sent to @%s rid=%s", target_bot, rid)
+                    except Exception as e2:
+                        return None, f"failed to send /start to @{target_bot}: {e} / {e2}"
+                return "waiting", None
+            else:
+                return None, f"malformed t.me deep link: {u}"
+        elif u:
             return u, None
 
     # INLINE BUTTON mode: fetch the original message, click the exact button
