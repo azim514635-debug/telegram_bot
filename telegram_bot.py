@@ -69,7 +69,7 @@ def load_env_file():
 load_env_file()
 
 # ── Constants ───────────────────────────────────────────────────────
-BASE_URL = (os.environ.get("API_BASE_URL") or "https://azim-studio.onrender.com").rstrip("/")
+BASE_URL = (os.environ.get("API_BASE_URL") or "https://azim.run.place").rstrip("/")
 PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("SITE_BASE_URL") or "https://azim.run.place").rstrip("/")
 TG_STORAGE_CHANNEL = os.environ.get("BIN_CHANNEL", "").strip()
 TG_STORAGE_CHANNEL_ID = os.environ.get("BIN_CHANNEL_ID", "").strip().lstrip("@")
