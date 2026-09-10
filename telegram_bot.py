@@ -1426,6 +1426,7 @@ async def _anymovie_on_event(event, edited=False):
 
         rid = None
         for rid_candidate, st in reversed(list(_anymovie_state.items())):
+            # Strict matching: peer_id must match exactly AND the request must be the most recent active one.
             if sender_peer_id is not None and st.get("peer_id") == sender_peer_id:
                 # Only match requests that were sent before this message arrived.
                 sent_at = st.get("sent_at") or 0
@@ -1435,12 +1436,38 @@ async def _anymovie_on_event(event, edited=False):
                 else:
                     msg_ts = time.time()
                 if msg_ts >= sent_at - 2:
-                    rid = rid_candidate
-                    break
+                    # Ensure this is the most recent active request - no other active request with same peer
+                    other_active_rids = []
+                    for other_rid, other_st in _anymovie_state.items():
+                        if other_rid != rid_candidate and other_st.get("peer_id") == sender_peer_id:
+                            # Check if the other request is still active (not posted yet)
+                            if not other_st.get("posted") and (other_st.get("sent_at") or 0) > sent_at:
+                                other_active_rids.append(other_rid)
+                    
+                    if not other_active_rids:
+                        rid = rid_candidate
+                        break
             elif st.get("peer_id") is None and st.get("peer"):
                 # Fallback: peer_id not resolved yet, match by username string.
-                rid = rid_candidate
-                break
+                # But only match if there are no other active requests with the same peer
+                other_active_same_peer = False
+                for other_rid, other_st in _anymovie_state.items():
+                    if other_rid != rid_candidate and other_st.get("peer_id") == sender_peer_id:
+                        if not other_st.get("posted") and (other_st.get("sent_at") or 0) > st.get("sent_at", 0):
+                            other_active_same_peer = True
+                            break
+                
+                if not other_active_same_peer:
+                    rid = rid_candidate
+                    break
+        if not rid:
+            return
+        state = _anymovie_state.get(rid)
+        if not state:
+            return
+        if state.get("posted"):
+            return
+
         if not rid:
             return
         state = _anymovie_state.get(rid)
@@ -1450,7 +1477,7 @@ async def _anymovie_on_event(event, edited=False):
             return
 
         logger.info("AnyMovie event: rid=%s msg_id=%s edited=%s sender=%s",
-                     rid, message.id, edited, uname)
+                    rid, message.id, edited, uname)
 
         media_opts = []
         if message.media is not None:
@@ -1650,6 +1677,7 @@ async def _anymovie_tap(client, app, rid, idx):
             if st == 200 and isinstance(body, dict) and body.get("buttons"):
                 state = {
                     "peer": ANYMOVIE_BOT,
+                    "peer_id": None,
                     "msg_id": body.get("msg_id"),
                     "buttons": body["buttons"],
                     "mode": body.get("mode", "button"),
@@ -1762,6 +1790,18 @@ async def _anymovie_tap(client, app, rid, idx):
                 except Exception:
                     uname = ""
                 if uname == ANYMOVIE_BOT.lower():
+                    # Verify this response is for the correct request BEFORE capturing it
+                    state_at_event = _anymovie_state.get(rid)
+                    if state_at_event is None:
+                        return
+                    # Additional verification: check if this matches the expected peer/entity
+                    # This prevents responses from being captured for wrong requests
+                    if m.sender_id and hasattr(m.sender, 'id'):
+                        # Verify this is actually the search bot
+                        if m.sender.id != state_at_event.get("peer_id"):
+                            logger.debug("AnyMovie: ignoring response from wrong peer rid=%s", rid)
+                            return
+                    
                     response_msg = m
                     response_event.set()
                     logger.info("AnyMovie: EVENT got msg id=%s media=%s text='%s' rid=%s",
@@ -1777,6 +1817,15 @@ async def _anymovie_tap(client, app, rid, idx):
                 except Exception:
                     uname = ""
                 if uname == ANYMOVIE_BOT.lower():
+                    # Same verification for edited messages
+                    state_at_event = _anymovie_state.get(rid)
+                    if state_at_event is None:
+                        return
+                    if m.sender_id and hasattr(m.sender, 'id'):
+                        if m.sender.id != state_at_event.get("peer_id"):
+                            logger.debug("AnyMovie: ignoring edit from wrong peer rid=%s", rid)
+                            return
+                    
                     response_msg = m
                     response_event.set()
                     logger.info("AnyMovie: EDIT got msg id=%s media=%s text='%s' rid=%s",
@@ -1798,7 +1847,7 @@ async def _anymovie_tap(client, app, rid, idx):
                     from telethon import functions
                     answer = await client(functions.messages.GetBotCallbackAnswerRequest(
                         peer=peer_entity, msg_id=msg_id, data=callback_data))
-                    logger.info("AnyMovie: CALLBACK FALLBACK answer=%s alert=%s url=%s cache_time=%s rid=%s",
+                    logger.info("AnyMovie: CALLBACK ANSWER RECEIVED answer=%s alert=%s url=%s cache_time=%s rid=%s",
                                 getattr(answer, "message", None),
                                 getattr(answer, "alert", None),
                                 getattr(answer, "url", None),
