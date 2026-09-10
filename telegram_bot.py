@@ -1364,7 +1364,8 @@ async def anymovie_poller(app: Application):
             # Housekeeping: drop stale in-memory button states so the bot never
             # keeps tapping old replies or leaks memory.
             now = time.monotonic()
-            for stale_rid in [rid for rid, st in list(_anymovie_state.items()) if (st.get("at") or 0) and now - st.get("at", 0) > 600]:
+            for stale_rid in [rid for rid, st in list(_anymovie_state.items()) if (st.get("at") or 0) and now - st.get("at", 0) > 1800]:
+                logger.info("AnyMovie: cleaning stale state rid=%s", stale_rid)
                 _anymovie_state.pop(stale_rid, None)
                 _anymovie_sent.discard(stale_rid)
         except Exception as e:
@@ -1384,14 +1385,15 @@ async def _anymovie_send_query(client, rid, query):
     try:
         sent = await client.send_message(target, query)
         _anymovie_state[rid]["sent_id"] = sent.id
+        logger.info("ANYMOVIE SEARCH START requestId=%s query='%s'", rid, query)
         # Remember the numeric peer so the event handler can attribute replies.
         try:
             from telethon import utils as _tu
             entity = await client.get_entity(target)
             peer_id = _tu.get_peer_id(entity)
             _anymovie_state[rid]["peer_id"] = peer_id
-            logger.info("AnyMovie: sent '%s' to @%s (peer_id=%s, sent_id=%s)",
-                        query, target, peer_id, sent.id)
+            logger.info("ANYMOVIE SEARCH TOKEN=%s peer_id=%s sent_id=%s",
+                        rid, peer_id, sent.id)
         except Exception as e:
             logger.info("AnyMovie: sent '%s' to @%s (sent_id=%s, peer_id resolve failed: %s)",
                         query, target, sent.id, e)
@@ -1461,6 +1463,7 @@ async def _anymovie_on_event(event, edited=False):
                     rid = rid_candidate
                     break
         if not rid:
+            logger.debug("AnyMovie: ignoring event - no matching active request sender=%s", uname)
             return
         state = _anymovie_state.get(rid)
         if not state:
@@ -1468,15 +1471,7 @@ async def _anymovie_on_event(event, edited=False):
         if state.get("posted"):
             return
 
-        if not rid:
-            return
-        state = _anymovie_state.get(rid)
-        if not state:
-            return
-        if state.get("posted"):
-            return
-
-        logger.info("AnyMovie event: rid=%s msg_id=%s edited=%s sender=%s",
+        logger.info("ANYMOVIE ACTIVE RESPONSE ACCEPTED requestId=%s msg_id=%s edited=%s sender=%s",
                     rid, message.id, edited, uname)
 
         media_opts = []
@@ -1615,6 +1610,9 @@ async def _await_anymovie_reply(client, rid):
 
     # Timeout: report whatever the bot said (spelling mistakes / 'no result'),
     # so the web shows the bot's own content instead of an endless spinner.
+    state_final = _anymovie_state.get(rid)
+    if state_final and state_final.get("posted"):
+        return
     detail = (last_text or "").strip()
     if not detail:
         detail = "No options found. Try a different spelling."
