@@ -1845,33 +1845,47 @@ async def _anymovie_tap(client, app, rid, idx):
         client.add_event_handler(_on_response, events.NewMessage(incoming=True))
         client.add_event_handler(_on_edit, events.MessageEdited())
 
-        # 5) Click the button — message.click() is PRIMARY.
-        logger.info("AnyMovie: CLICK RPC SENT row=%d col=%d rid=%s", target_row, target_col, rid)
-        try:
-            await message.click(target_row, target_col)
-            logger.info("AnyMovie: message.click() completed rid=%s", rid)
-        except Exception as e:
-            logger.warning("AnyMovie: message.click() failed: %s, trying callback fallback", e)
-            callback_data = getattr(target_btn, "data", None)
-            if callback_data:
-                try:
-                    from telethon import functions
-                    answer = await client(functions.messages.GetBotCallbackAnswerRequest(
-                        peer=peer_entity, msg_id=msg_id, data=callback_data))
-                    logger.info("AnyMovie: CALLBACK ANSWER RECEIVED answer=%s alert=%s url=%s cache_time=%s rid=%s",
-                                getattr(answer, "message", None),
-                                getattr(answer, "alert", None),
-                                getattr(answer, "url", None),
-                                getattr(answer, "cache_time", None), rid)
-                except Exception as e2:
-                    client.remove_event_handler(_on_response)
-                    client.remove_event_handler(_on_edit)
-                    return None, f"both click and callback failed: {e} / {e2}"
-            else:
-                client.remove_event_handler(_on_response)
-                client.remove_event_handler(_on_edit)
-                return None, f"click failed and no callback data: {e}"
+        # 5) Send callback answer via GetBotCallbackAnswerRequest to get the
+        #    response URL — message.click() doesn't return the answer.
+        callback_data = getattr(target_btn, "data", None)
+        if not callback_data:
+            client.remove_event_handler(_on_response)
+            client.remove_event_handler(_on_edit)
+            return None, "button has no callback data"
 
+        from telethon import functions
+        logger.info("AnyMovie: CALLBACK ANSWER REQUEST row=%d col=%d rid=%s", target_row, target_col, rid)
+        try:
+            answer = await client(functions.messages.GetBotCallbackAnswerRequest(
+                peer=peer_entity, msg_id=msg_id, data=callback_data))
+            answer_url = getattr(answer, "url", None)
+            answer_msg = getattr(answer, "message", None)
+            logger.info("AnyMovie: CALLBACK ANSWER url=%s msg=%s alert=%s rid=%s",
+                        answer_url, answer_msg, getattr(answer, "alert", None), rid)
+        except Exception as e:
+            client.remove_event_handler(_on_response)
+            client.remove_event_handler(_on_edit)
+            return None, f"GetBotCallbackAnswer failed: {e}"
+
+        # If the callback answer contains a URL, that IS the result.
+        if answer_url:
+            client.remove_event_handler(_on_response)
+            client.remove_event_handler(_on_edit)
+            logger.info("AnyMovie: GOT URL FROM CALLBACK rid=%s url=%s", rid, answer_url)
+            # If it's a t.me deep link, extract and send /start
+            m = re.match(r'https?://t\.me/(\w+)\?start=(.+)', answer_url)
+            if m:
+                target_bot = m.group(1)
+                start_param = m.group(2)
+                try:
+                    await client.send_message(target_bot, f"/start {start_param}")
+                    logger.info("AnyMovie: /start sent to @%s rid=%s", target_bot, rid)
+                except Exception as e:
+                    logger.warning("AnyMovie: /start failed: %s", e)
+                return "waiting", None
+            return answer_url, None
+
+        # No URL in answer — wait for a new message (file) from the bot.
         # 6) Wait for actual response from event listener (up to 40s).
         logger.info("AnyMovie: waiting for MOVIE RESPONSE rid=%s", rid)
         try:
