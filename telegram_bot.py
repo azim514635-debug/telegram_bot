@@ -1707,11 +1707,10 @@ async def _anymovie_tap(client, app, rid, idx):
                 return None, "chosen message has no media"
             # Forward the actual message to the card bot — no re-upload.
             try:
-                await client.forward_messages(BOT_USERNAME, messages=media_msg.id, from_peer=peer)
-                logger.info("AnyMovie: forwarded file to bot rid=%s msg_id=%s", rid, media_msg.id)
-                # Register pending forward so handle_media can link the card.
                 _api_request_json("/api/anymovie/pending-forward", "POST",
                                   {"requestId": rid}, config.boss_secret)
+                await client.forward_messages(BOT_USERNAME, messages=media_msg.id, from_peer=peer)
+                logger.info("AnyMovie: forwarded file to bot rid=%s msg_id=%s", rid, media_msg.id)
             except Exception as e:
                 # Fallback: send_file with marker if forward fails.
                 logger.warning("AnyMovie: forward failed, falling back to send_file: %s", e)
@@ -1801,11 +1800,11 @@ async def _anymovie_tap(client, app, rid, idx):
                 client.remove_event_handler(_on_dl_edit)
 
                 if response_msg and response_msg.media:
+                    _api_request_json("/api/anymovie/pending-forward", "POST",
+                                      {"requestId": rid}, config.boss_secret)
                     try:
                         await client.forward_messages(BOT_USERNAME, messages=response_msg.id, from_peer=target_bot)
                         logger.info("AnyMovie: deep-link file forwarded to bot rid=%s msg_id=%s", rid, response_msg.id)
-                        _api_request_json("/api/anymovie/pending-forward", "POST",
-                                          {"requestId": rid}, config.boss_secret)
                     except Exception as e:
                         logger.warning("AnyMovie: deep-link forward failed, fallback: %s", e)
                         try:
@@ -2080,10 +2079,10 @@ async def _anymovie_tap(client, app, rid, idx):
         logger.info("AnyMovie: FORWARDING TO CARD BOT msg_id=%s rid=%s", response_msg.id, rid)
         tg_link = ""
         try:
-            await client.forward_messages(BOT_USERNAME, messages=response_msg.id, from_peer=peer_entity)
-            logger.info("AnyMovie: CARD PIPELINE STARTED rid=%s msg_id=%s", rid, response_msg.id)
             _api_request_json("/api/anymovie/pending-forward", "POST",
                               {"requestId": rid}, config.boss_secret)
+            await client.forward_messages(BOT_USERNAME, messages=response_msg.id, from_peer=peer_entity)
+            logger.info("AnyMovie: CARD PIPELINE STARTED rid=%s msg_id=%s", rid, response_msg.id)
         except Exception as e:
             logger.warning("AnyMovie: forward failed, fallback send_file: %s", e)
             try:
