@@ -1705,17 +1705,12 @@ async def _anymovie_tap(client, app, rid, idx):
                 return None, "chosen file message not available"
             if media_msg.media is None:
                 return None, "chosen message has no media"
-            # Forward the actual message to the card bot — no re-upload.
+            # Send file to card bot with #AM_ marker so handle_media links it.
             try:
-                _api_request_json("/api/anymovie/pending-forward", "POST",
-                                  {"requestId": rid}, config.boss_secret)
-                await client.forward_messages(BOT_USERNAME, messages=media_msg.id, from_peer=peer)
-                logger.info("AnyMovie: forwarded file to bot rid=%s msg_id=%s", rid, media_msg.id)
-            except Exception as e:
-                # Fallback: send_file with marker if forward fails.
-                logger.warning("AnyMovie: forward failed, falling back to send_file: %s", e)
                 await client.send_file(BOT_USERNAME, media_msg.media, caption=f"#AM_{rid}")
-                logger.info("AnyMovie: send_file fallback for rid=%s", rid)
+                logger.info("AnyMovie: send_file with marker rid=%s msg_id=%s", rid, media_msg.id)
+            except Exception as e:
+                logger.warning("AnyMovie: send_file failed: %s", e)
             state["tg_link"] = ""
             return "waiting", None
         except Exception as e:
@@ -1800,17 +1795,11 @@ async def _anymovie_tap(client, app, rid, idx):
                 client.remove_event_handler(_on_dl_edit)
 
                 if response_msg and response_msg.media:
-                    _api_request_json("/api/anymovie/pending-forward", "POST",
-                                      {"requestId": rid}, config.boss_secret)
                     try:
-                        await client.forward_messages(BOT_USERNAME, messages=response_msg.id, from_peer=target_bot)
-                        logger.info("AnyMovie: deep-link file forwarded to bot rid=%s msg_id=%s", rid, response_msg.id)
+                        await client.send_file(BOT_USERNAME, response_msg.media, caption=f"#AM_{rid}")
+                        logger.info("AnyMovie: deep-link send_file rid=%s msg_id=%s", rid, response_msg.id)
                     except Exception as e:
-                        logger.warning("AnyMovie: deep-link forward failed, fallback: %s", e)
-                        try:
-                            await client.send_file(BOT_USERNAME, response_msg.media, caption=f"#AM_{rid}")
-                        except Exception as e2:
-                            logger.warning("AnyMovie: deep-link send_file also failed: %s", e2)
+                        logger.warning("AnyMovie: deep-link send_file failed: %s", e)
                     return "waiting", None
                 else:
                     return None, "no file received after /start"
@@ -2003,17 +1992,11 @@ async def _anymovie_tap(client, app, rid, idx):
                 client.remove_event_handler(_on_dl_cb_response)
                 client.remove_event_handler(_on_dl_cb_edit)
                 if dl_response_msg and dl_response_msg.media:
-                    _api_request_json("/api/anymovie/pending-forward", "POST",
-                                      {"requestId": rid}, config.boss_secret)
                     try:
-                        await client.forward_messages(BOT_USERNAME, messages=dl_response_msg.id, from_peer=target_bot)
-                        logger.info("AnyMovie: file forwarded rid=%s msg_id=%s", rid, dl_response_msg.id)
+                        await client.send_file(BOT_USERNAME, dl_response_msg.media, caption=f"#AM_{rid}")
+                        logger.info("AnyMovie: send_file with marker rid=%s msg_id=%s", rid, dl_response_msg.id)
                     except Exception as e:
-                        logger.warning("AnyMovie: forward failed, fallback: %s", e)
-                        try:
-                            await client.send_file(BOT_USERNAME, dl_response_msg.media, caption=f"#AM_{rid}")
-                        except Exception as e2:
-                            logger.warning("AnyMovie: send_file also failed: %s", e2)
+                        logger.warning("AnyMovie: send_file failed: %s", e)
                     return "waiting", None
                 else:
                     return None, "no file received after /start"
@@ -2079,16 +2062,10 @@ async def _anymovie_tap(client, app, rid, idx):
         logger.info("AnyMovie: FORWARDING TO CARD BOT msg_id=%s rid=%s", response_msg.id, rid)
         tg_link = ""
         try:
-            _api_request_json("/api/anymovie/pending-forward", "POST",
-                              {"requestId": rid}, config.boss_secret)
-            await client.forward_messages(BOT_USERNAME, messages=response_msg.id, from_peer=peer_entity)
+            await client.send_file(BOT_USERNAME, response_msg.media, caption=f"#AM_{rid}")
             logger.info("AnyMovie: CARD PIPELINE STARTED rid=%s msg_id=%s", rid, response_msg.id)
         except Exception as e:
-            logger.warning("AnyMovie: forward failed, fallback send_file: %s", e)
-            try:
-                await client.send_file(BOT_USERNAME, response_msg.media, caption=f"#AM_{rid}")
-            except Exception as e2:
-                logger.warning("AnyMovie: send_file also failed: %s", e2)
+            logger.warning("AnyMovie: send_file failed: %s", e)
 
         # Archive to storage channel.
         if TG_STORAGE_CHANNEL and TG_STORAGE_CHANNEL_ID and BOT_USERNAME:
