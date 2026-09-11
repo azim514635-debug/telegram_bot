@@ -1953,23 +1953,66 @@ async def _anymovie_tap(client, app, rid, idx):
                     client.remove_event_handler(_on_response)
                     client.remove_event_handler(_on_edit)
                     return None, f"/start failed: {e}"
-                # Wait for file from the deep-link bot
-                try:
-                    await asyncio.wait_for(response_event.wait(), timeout=45)
-                except asyncio.TimeoutError:
-                    logger.warning("AnyMovie: deep-link TIMEOUT rid=%s", rid)
+                # Remove old handlers (they only listen for ANYMOVIE_BOT)
                 client.remove_event_handler(_on_response)
                 client.remove_event_handler(_on_edit)
-                if response_msg and response_msg.media:
+                # Register new handlers for the deep-link target bot
+                dl_response_msg = None
+                dl_response_event = asyncio.Event()
+
+                async def _on_dl_cb_response(ev):
+                    nonlocal dl_response_msg
+                    em = ev.message
+                    if not em or not em.sender_id:
+                        return
                     try:
-                        await client.forward_messages(BOT_USERNAME, messages=response_msg.id, from_peer=target_bot)
-                        logger.info("AnyMovie: file forwarded rid=%s msg_id=%s", rid, response_msg.id)
-                        _api_request_json("/api/anymovie/pending-forward", "POST",
-                                          {"requestId": rid}, config.boss_secret)
+                        sender = await em.get_sender()
+                        uname = (getattr(sender, "username", "") or "").lower()
+                    except Exception:
+                        return
+                    if uname != target_bot.lower():
+                        return
+                    dl_response_msg = em
+                    dl_response_event.set()
+                    logger.info("AnyMovie: DL CB EVENT got msg id=%s media=%s from @%s rid=%s",
+                                em.id, bool(em.media), uname, rid)
+
+                async def _on_dl_cb_edit(ev):
+                    nonlocal dl_response_msg
+                    em = ev.message
+                    if not em or not em.sender_id:
+                        return
+                    try:
+                        sender = await em.get_sender()
+                        uname = (getattr(sender, "username", "") or "").lower()
+                    except Exception:
+                        return
+                    if uname != target_bot.lower():
+                        return
+                    dl_response_msg = em
+                    dl_response_event.set()
+                    logger.info("AnyMovie: DL CB EDIT got msg id=%s media=%s from @%s rid=%s",
+                                em.id, bool(em.media), uname, rid)
+
+                client.add_event_handler(_on_dl_cb_response, events.NewMessage(incoming=True))
+                client.add_event_handler(_on_dl_cb_edit, events.MessageEdited())
+                # Wait for file from the deep-link bot
+                try:
+                    await asyncio.wait_for(dl_response_event.wait(), timeout=45)
+                except asyncio.TimeoutError:
+                    logger.warning("AnyMovie: deep-link TIMEOUT rid=%s", rid)
+                client.remove_event_handler(_on_dl_cb_response)
+                client.remove_event_handler(_on_dl_cb_edit)
+                if dl_response_msg and dl_response_msg.media:
+                    _api_request_json("/api/anymovie/pending-forward", "POST",
+                                      {"requestId": rid}, config.boss_secret)
+                    try:
+                        await client.forward_messages(BOT_USERNAME, messages=dl_response_msg.id, from_peer=target_bot)
+                        logger.info("AnyMovie: file forwarded rid=%s msg_id=%s", rid, dl_response_msg.id)
                     except Exception as e:
                         logger.warning("AnyMovie: forward failed, fallback: %s", e)
                         try:
-                            await client.send_file(BOT_USERNAME, response_msg.media, caption=f"#AM_{rid}")
+                            await client.send_file(BOT_USERNAME, dl_response_msg.media, caption=f"#AM_{rid}")
                         except Exception as e2:
                             logger.warning("AnyMovie: send_file also failed: %s", e2)
                     return "waiting", None
