@@ -1939,21 +1939,47 @@ async def _anymovie_tap(client, app, rid, idx):
 
         # If the callback answer contains a URL, that IS the result.
         if answer_url:
-            client.remove_event_handler(_on_response)
-            client.remove_event_handler(_on_edit)
             logger.info("AnyMovie: GOT URL FROM CALLBACK rid=%s url=%s", rid, answer_url)
-            # If it's a t.me deep link, extract and send /start
-            m = re.match(r'https?://t\.me/(\w+)\?start=(.+)', answer_url)
-            if m:
-                target_bot = m.group(1)
-                start_param = m.group(2)
+            # If it's a t.me deep link, extract and send /start, then wait for file
+            dm = re.match(r'https?://t\.me/(\w+)\?start=(.+)', answer_url)
+            if dm:
+                target_bot = dm.group(1)
+                start_param = dm.group(2)
                 try:
                     await client.send_message(target_bot, f"/start {start_param}")
                     logger.info("AnyMovie: /start sent to @%s rid=%s", target_bot, rid)
                 except Exception as e:
                     logger.warning("AnyMovie: /start failed: %s", e)
-                return "waiting", None
-            return answer_url, None
+                    client.remove_event_handler(_on_response)
+                    client.remove_event_handler(_on_edit)
+                    return None, f"/start failed: {e}"
+                # Wait for file from the deep-link bot
+                try:
+                    await asyncio.wait_for(response_event.wait(), timeout=45)
+                except asyncio.TimeoutError:
+                    logger.warning("AnyMovie: deep-link TIMEOUT rid=%s", rid)
+                client.remove_event_handler(_on_response)
+                client.remove_event_handler(_on_edit)
+                if response_msg and response_msg.media:
+                    try:
+                        await client.forward_messages(BOT_USERNAME, messages=response_msg.id, from_peer=target_bot)
+                        logger.info("AnyMovie: file forwarded rid=%s msg_id=%s", rid, response_msg.id)
+                        _api_request_json("/api/anymovie/pending-forward", "POST",
+                                          {"requestId": rid}, config.boss_secret)
+                    except Exception as e:
+                        logger.warning("AnyMovie: forward failed, fallback: %s", e)
+                        try:
+                            await client.send_file(BOT_USERNAME, response_msg.media, caption=f"#AM_{rid}")
+                        except Exception as e2:
+                            logger.warning("AnyMovie: send_file also failed: %s", e2)
+                    return "waiting", None
+                else:
+                    return None, "no file received after /start"
+            else:
+                # Regular URL (not deep link) — return it directly
+                client.remove_event_handler(_on_response)
+                client.remove_event_handler(_on_edit)
+                return answer_url, None
 
         # No URL in answer — wait for a new message (file) from the bot.
         # 6) Wait for actual response from event listener (up to 40s).
