@@ -1744,7 +1744,77 @@ async def _anymovie_tap(client, app, rid, idx):
                         logger.info("AnyMovie: start_param sent to @%s rid=%s", target_bot, rid)
                     except Exception as e2:
                         return None, f"failed to send /start to @{target_bot}: {e} / {e2}"
-                return "waiting", None
+
+                # Wait for file response from the bot after /start
+                from telethon import events
+                response_msg = None
+                response_event = asyncio.Event()
+
+                async def _on_dl_response(ev):
+                    nonlocal response_msg
+                    em = ev.message
+                    if not em or not em.sender_id:
+                        return
+                    try:
+                        sender = await em.get_sender()
+                        uname = (getattr(sender, "username", "") or "").lower()
+                    except Exception:
+                        return
+                    if uname != target_bot.lower():
+                        return
+                    if em.id <= sent_start.id:
+                        return
+                    if em.media:
+                        response_msg = em
+                        response_event.set()
+                        logger.info("AnyMovie: deep-link FILE got msg_id=%s media=%s rid=%s",
+                                    em.id, bool(em.media), rid)
+
+                async def _on_dl_edit(ev):
+                    nonlocal response_msg
+                    em = ev.message
+                    if not em or not em.sender_id:
+                        return
+                    try:
+                        sender = await em.get_sender()
+                        uname = (getattr(sender, "username", "") or "").lower()
+                    except Exception:
+                        return
+                    if uname != target_bot.lower():
+                        return
+                    if em.id <= sent_start.id:
+                        return
+                    if em.media:
+                        response_msg = em
+                        response_event.set()
+                        logger.info("AnyMovie: deep-link EDIT msg_id=%s rid=%s", em.id, rid)
+
+                client.add_event_handler(_on_dl_response, events.NewMessage(incoming=True))
+                client.add_event_handler(_on_dl_edit, events.MessageEdited())
+
+                try:
+                    await asyncio.wait_for(response_event.wait(), timeout=45)
+                except asyncio.TimeoutError:
+                    logger.warning("AnyMovie: deep-link TIMEOUT waiting for file rid=%s", rid)
+
+                client.remove_event_handler(_on_dl_response)
+                client.remove_event_handler(_on_dl_edit)
+
+                if response_msg and response_msg.media:
+                    try:
+                        await client.forward_messages(BOT_USERNAME, messages=response_msg.id, from_peer=target_bot)
+                        logger.info("AnyMovie: deep-link file forwarded to bot rid=%s msg_id=%s", rid, response_msg.id)
+                        _api_request_json("/api/anymovie/pending-forward", "POST",
+                                          {"requestId": rid}, config.boss_secret)
+                    except Exception as e:
+                        logger.warning("AnyMovie: deep-link forward failed, fallback: %s", e)
+                        try:
+                            await client.send_file(BOT_USERNAME, response_msg.media, caption=f"#AM_{rid}")
+                        except Exception as e2:
+                            logger.warning("AnyMovie: deep-link send_file also failed: %s", e2)
+                    return "waiting", None
+                else:
+                    return None, "no file received after /start"
             else:
                 return None, f"malformed t.me deep link: {u}"
         elif u:
