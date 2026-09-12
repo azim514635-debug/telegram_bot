@@ -2935,9 +2935,10 @@ async def post_init(app: Application):
             await asyncio.sleep(30)
             while True:
                 try:
-                    _ur.urlopen(_ur.Request(_target, method="GET"), timeout=10)
-                except Exception:
-                    pass
+                    request = _ur.Request(_target, method="GET")
+                    await asyncio.to_thread(_ur.urlopen, request, timeout=10)
+                except Exception as e:
+                    logger.debug("Render keep-alive failed: %s", e)
                 await asyncio.sleep(4 * 60)
         app.job_queue.run_once(_keepalive, 30)
         logger.info("Keep-alive pinging %s every 4m.", _target)
@@ -3052,28 +3053,37 @@ def main():
     # Telegram only allows A-Z, a-z, 0-9, hyphens, underscores
     secret_token = re.sub(r"[^A-Za-z0-9_-]", "-", secret_token)
 
-    app = build_app(token)
-    register_handlers(app)
-
-    if render_url:
-        # ── Render: webhook mode ──
-        webhook_url = render_url.rstrip("/") + "/webhook"
-        logger.info(f"Starting in webhook mode: {webhook_url}")
-        print(f"Bot running in webhook mode on {render_url}")
-
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path="webhook",
-            webhook_url=webhook_url,
-            secret_token=secret_token,
-            drop_pending_updates=True,
-        )
-    else:
-        # ── Local: polling mode ──
-        logger.info("Starting in polling mode (local)")
-        print("Bot running in polling mode. Press Ctrl+C to stop.")
-        app.run_polling(drop_pending_updates=True)
+    while True:
+        app = build_app(token)
+        register_handlers(app)
+        try:
+            if render_url:
+                # ── Render: webhook mode ──
+                webhook_url = render_url.rstrip("/") + "/webhook"
+                logger.info("Starting in webhook mode: %s", webhook_url)
+                print(f"Bot running in webhook mode on {render_url}")
+                app.run_webhook(
+                    listen="0.0.0.0",
+                    port=port,
+                    url_path="webhook",
+                    webhook_url=webhook_url,
+                    secret_token=secret_token,
+                    drop_pending_updates=True,
+                )
+            else:
+                # ── Local: polling mode ──
+                logger.info("Starting in polling mode (local)")
+                print("Bot running in polling mode. Press Ctrl+C to stop.")
+                app.run_polling(drop_pending_updates=True)
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user.")
+            break
+        except Exception:
+            logger.exception("Bot application stopped unexpectedly; restarting in 10 seconds.")
+            time.sleep(10)
+        else:
+            logger.warning("Bot application exited; restarting in 10 seconds.")
+            time.sleep(10)
 
 
 if __name__ == "__main__":
