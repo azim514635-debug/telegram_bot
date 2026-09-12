@@ -836,12 +836,14 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # clicks the Instant Get button.  The secretary_poller will pick it up.
     if item_id and tg_link:
         try:
-            api_request(
+            status, body = api_request(
                 "/api/instant-get",
                 "POST",
                 {"movieId": item_id},
                 boss_secret=config.boss_secret,
             )
+            if status != 200 or not isinstance(body, dict) or not body.get("success"):
+                raise RuntimeError(f"HTTP {status}: {body}")
             logger.info("Auto-triggered instant-get for '%s' (id=%s)", title, item_id)
         except Exception as e:
             logger.warning("Auto instant-get trigger failed for '%s': %s", title, e)
@@ -849,12 +851,14 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Link card to Any Movie request if marker was present.
     if anymovie_rid and item_id:
         try:
-            api_request(
+            status, body = api_request(
                 "/api/anymovie/link-card",
                 "POST",
                 {"requestId": anymovie_rid, "cardId": item_id},
                 boss_secret=config.boss_secret,
             )
+            if status != 200 or not isinstance(body, dict) or not body.get("success"):
+                raise RuntimeError(f"HTTP {status}: {body}")
             logger.info("AnyMovie: linked card %s to request %s", item_id, anymovie_rid)
             await status_msg.edit_text(
                 "<b>✅ Any Movie card ready!</b>\n\n"
@@ -974,6 +978,12 @@ async def secretary_poller(app: Application):
     # Try to bring up the user client; fall back to the bot if unavailable.
     user_client = await start_user_client()
     use_user = user_client is not None
+
+    while user_client is None:
+        logger.warning("Secretary: user client unavailable; retrying in 30 seconds.")
+        await asyncio.sleep(30)
+        user_client = await start_user_client()
+    use_user = True
 
     link_gen_chat_id = _resolve_link_gen_chat_id(user_client if use_user else app.bot)
 
@@ -1279,9 +1289,10 @@ async def anymovie_poller(app: Application):
         return
 
     user_client = await start_user_client()
-    if user_client is None:
-        logger.warning("AnyMovie: no Telethon user client (set API_ID/API_HASH/USER_STRING_SESSION).")
-        return
+    while user_client is None:
+        logger.warning("AnyMovie: user client unavailable; retrying in 30 seconds.")
+        await asyncio.sleep(30)
+        user_client = await start_user_client()
 
     # Event-driven capture: search bots commonly reply by EDITING a message in
     # place to swap in the button menu, so listen for both new and edited
@@ -1298,6 +1309,13 @@ async def anymovie_poller(app: Application):
 
     while True:
         try:
+            if not user_client.is_connected():
+                logger.warning("AnyMovie: Telethon disconnected; reconnecting.")
+                user_client = await start_user_client()
+                if user_client is None:
+                    await asyncio.sleep(30)
+                    continue
+
             # 1) New searches -> send the movie name to the search bot, capture buttons.
             st, body = api_request("/api/anymovie/search-pending", "GET", boss_secret=config.boss_secret)
             if st != 200:
@@ -1334,7 +1352,7 @@ async def anymovie_poller(app: Application):
                         continue
                     logger.info("AnyMovie: tapping button %s for %s", idx, rid)
                     try:
-                        result_url, err = await _anymovie_tap(user_client, app, rid, int(idx))
+                        result_url, err = await _anymovie_tap(user_client, app, rid, int(idx), req.get("query", ""))
                         _st = _anymovie_state.get(rid, {})
                         _query = req.get("query", "")
                         _tg = _st.get("tg_link", "")
@@ -1647,8 +1665,11 @@ def _anymovie_post_buttons(rid, options, error_text=None):
         labels.append(entry)
     # Use JSON body so the server receives buttons as an actual array,
     # not a URL-encoded string representation.
-    _api_request_json("/api/anymovie/buttons", "POST",
-                      {"requestId": rid, "buttons": labels}, config.boss_secret)
+    state = _anymovie_state.get(rid) or {}
+    payload = {"requestId": rid, "buttons": labels}
+    if state.get("msg_id"):
+        payload["msg_id"] = state["msg_id"]
+    _api_request_json("/api/anymovie/buttons", "POST", payload, config.boss_secret)
     st = _anymovie_state.get(rid)
     if st is not None:
         st["posted"] = True
@@ -1656,7 +1677,7 @@ def _anymovie_post_buttons(rid, options, error_text=None):
                 _anymovie_state.get(rid, {}).get("mode"))
 
 
-async def _anymovie_tap(client, app, rid, idx):
+async def _anymovie_tap(client, app, rid, idx, movie_title=""):
     """Tap the chosen button on the search bot's reply and forward the
     resulting file to the card-making bot via forward_messages (no re-upload).
     The card bot's handle_media detects #AM_<rid> and creates the card."""
@@ -1687,6 +1708,9 @@ async def _anymovie_tap(client, app, rid, idx):
             return None, f"buttons state missing (search may have timed out): {e}"
 
     buttons = state.get("buttons") or []
+    marker_caption = f"#AM_{rid}"
+    if movie_title:
+        marker_caption += " " + str(movie_title).strip()[:80]
     if idx < 0 or idx >= len(buttons):
         return None, f"invalid button index {idx} (have {len(buttons)} buttons)"
     chosen = buttons[idx]
@@ -1707,7 +1731,7 @@ async def _anymovie_tap(client, app, rid, idx):
                 return None, "chosen message has no media"
             # Send file to card bot with #AM_ marker so handle_media links it.
             try:
-                await client.send_file(BOT_USERNAME, media_msg.media, caption=f"#AM_{rid}")
+                await client.send_file(BOT_USERNAME, media_msg.media, caption=marker_caption)
                 logger.info("AnyMovie: send_file with marker rid=%s msg_id=%s", rid, media_msg.id)
             except Exception as e:
                 logger.warning("AnyMovie: send_file failed: %s", e)
@@ -1796,7 +1820,7 @@ async def _anymovie_tap(client, app, rid, idx):
 
                 if response_msg and response_msg.media:
                     try:
-                        await client.send_file(BOT_USERNAME, response_msg.media, caption=f"#AM_{rid}")
+                        await client.send_file(BOT_USERNAME, response_msg.media, caption=marker_caption)
                         logger.info("AnyMovie: deep-link send_file rid=%s msg_id=%s", rid, response_msg.id)
                     except Exception as e:
                         logger.warning("AnyMovie: deep-link send_file failed: %s", e)
@@ -1993,7 +2017,7 @@ async def _anymovie_tap(client, app, rid, idx):
                 client.remove_event_handler(_on_dl_cb_edit)
                 if dl_response_msg and dl_response_msg.media:
                     try:
-                        await client.send_file(BOT_USERNAME, dl_response_msg.media, caption=f"#AM_{rid}")
+                        await client.send_file(BOT_USERNAME, dl_response_msg.media, caption=marker_caption)
                         logger.info("AnyMovie: send_file with marker rid=%s msg_id=%s", rid, dl_response_msg.id)
                     except Exception as e:
                         logger.warning("AnyMovie: send_file failed: %s", e)
@@ -2013,6 +2037,25 @@ async def _anymovie_tap(client, app, rid, idx):
             await asyncio.wait_for(response_event.wait(), timeout=40)
         except asyncio.TimeoutError:
             logger.warning("AnyMovie: TIMEOUT waiting for response rid=%s", rid)
+
+        # Some search bots update the chat without delivering a reliable
+        # Telethon event. Do one final read after the callback before failing.
+        if response_msg is None:
+            try:
+                async for candidate in client.iter_messages(peer_entity, limit=10):
+                    if candidate.id <= msg_id:
+                        continue
+                    sender = await candidate.get_sender()
+                    username = (getattr(sender, "username", "") or "").lower()
+                    if username == ANYMOVIE_BOT.lower():
+                        response_msg = candidate
+                        logger.info(
+                            "AnyMovie: POLL found response id=%s media=%s rid=%s",
+                            candidate.id, bool(candidate.media), rid,
+                        )
+                        break
+            except Exception as e:
+                logger.warning("AnyMovie: final response scan failed: %s", e)
 
         # Cleanup event handlers.
         client.remove_event_handler(_on_response)
@@ -2062,7 +2105,7 @@ async def _anymovie_tap(client, app, rid, idx):
         logger.info("AnyMovie: FORWARDING TO CARD BOT msg_id=%s rid=%s", response_msg.id, rid)
         tg_link = ""
         try:
-            await client.send_file(BOT_USERNAME, response_msg.media, caption=f"#AM_{rid}")
+            await client.send_file(BOT_USERNAME, response_msg.media, caption=marker_caption)
             logger.info("AnyMovie: CARD PIPELINE STARTED rid=%s msg_id=%s", rid, response_msg.id)
         except Exception as e:
             logger.warning("AnyMovie: send_file failed: %s", e)
