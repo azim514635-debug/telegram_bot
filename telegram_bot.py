@@ -1005,7 +1005,17 @@ async def secretary_poller(app: Application):
                 movie_title = req.get("movieTitle", "Untitled")
                 telegram_url = req.get("telegramUrl", "")
 
-                if not req_id or not movie_url:
+                # Older cards may not have movieUrl, but their Telegram deep
+                # link is enough to forward the archived file.
+                if not req_id:
+                    continue
+                if not movie_url and not telegram_url:
+                    await _update_instant_result(
+                        req_id,
+                        "error",
+                        None,
+                        "Card has no Telegram file link",
+                    )
                     continue
 
                 logger.info("Secretary: processing instant-get for '%s' (id=%s)", movie_title, req_id)
@@ -1109,6 +1119,11 @@ async def _relay_via_user_client(client, link_gen_chat_id, telegram_url, req_id)
         if not LINK_GENERATOR_BOT:
             return False, "LINK_GENERATOR_BOT not set"
         target = LINK_GENERATOR_BOT
+        target_entity = await client.get_entity(target)
+        peer_id = _tu.get_peer_id(target_entity)
+        # Register the reply route before sending because the link bot can
+        # answer immediately, before forward_messages() returns.
+        _instant_get_reply_map[peer_id] = req_id
 
         from_chat_id = msg_id = None
         if telegram_url and "start=file_" in telegram_url:
@@ -1132,13 +1147,12 @@ async def _relay_via_user_client(client, link_gen_chat_id, telegram_url, req_id)
             sent = await client.send_message(target, telegram_url or "")
 
         if sent is None:
+            _instant_get_reply_map.pop(peer_id, None)
             return False, "relay returned nothing"
-
-        # Map the peer we sent to -> this request so the reply handler matches.
-        peer_id = _tu.get_peer_id(await client.get_entity(target))
-        _instant_get_reply_map[peer_id] = req_id
         return True, None
     except Exception as e:
+        if "peer_id" in locals():
+            _instant_get_reply_map.pop(peer_id, None)
         logger.warning("Secretary: user-client relay failed: %s", e)
         return False, str(e)
 
