@@ -749,10 +749,10 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     am_match = _re.search(r'#AM_(\w+)', caption_full)
     if am_match:
         anymovie_rid = am_match.group(1)
-        # Clean the marker from title if it's the only content
-        title_cleaned = _re.sub(r'#AM_\w+\s*', '', caption_full).strip()
-        if title_cleaned:
-            title = title_cleaned.splitlines()[0][:80]
+        # The search query in the marker is not the movie title. Prefer the
+        # filename supplied by the Telegram search bot and only use a generic
+        # fallback when Telegram provided no title metadata.
+        title = (file_name or "Telegram Movie").strip().splitlines()[0][:80] or "Telegram Movie"
         logger.info("AnyMovie: handle_media detected marker rid=%s title=%s", anymovie_rid, title)
     else:
         # No #AM_ marker — check if this is a pending forward from Any Movie tap.
